@@ -1,0 +1,2904 @@
+import { newRpcResponse } from "@hono/capnweb";
+import { getAgentByName } from "agents";
+import { createMcpHandler } from "agents/mcp";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { fetchAttachment } from "./attachments";
+import { AuthError, canonicalizeEmail, checkAllowlist, checkBrowserEnabled, getSharedIndexStub, getUserControlStub, isAdmin, isDevMode, resolveAdminEmail, verifyAccess } from "./auth";
+import { ChatMonitorAgent, chatMonitorIdName, createMonitorSchema } from "./chat-monitor-agent";
+import { CodingAgent } from "./coding-agent";
+import { ExploreAgent } from "./explore-agent";
+import { runHealthCheck } from "./health-check";
+import { log } from "./logger";
+import { createDodoMcpServer } from "./mcp";
+import { MCP_CATALOG } from "./mcp-catalog";
+import { createDodoCodeModeMcpServer } from "./mcp-codemode";
+import { AllowlistOutbound } from "./outbound";
+import { errorLimiter, maybeCleanupRateLimiters, messageLimiter, promptLimiter, shareLimiter } from "./rate-limit";
+import { buildAuthenticatedApi } from "./rpc";
+import { forkSessionInternal, SourceSessionMissingError } from "./sessions";
+import { signCookie, verifyCookie } from "./share";
+import { SharedIndex } from "./shared-index";
+import { TaskAgent } from "./task-agent";
+import type { AccessIdentity, AppConfig, Env } from "./types";
+import { UserControl } from "./user-control";
+
+// Rate limiters live in src/rate-limit.ts so MCP tools can charge the
+// same per-user budgets as the HTTP routes (audit follow-up F3).
+
+type PermissionLevel = "readonly" | "readwrite" | "write" | "admin";
+
+type HonoEnv = { Bindings: Env; Variables: { identity: AccessIdentity; userEmail: string; sessionPermission: PermissionLevel; sessionOwnerEmail: string; mcpServiceMode: boolean } };
+
+const app = new Hono<HonoEnv>();
+
+app.use("*", cors({ origin: "*", allowHeaders: ["Content-Type", "x-dodo-session-id"], allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] }));
+
+// Clean up rate limiter windows periodically
+app.use("*", async (c, next) => {
+  maybeCleanupRateLimiters();
+  return next();
+});
+
+// ─── Helper functions ───
+
+function proxyRequest(url: string, request: Request, headers: Headers): Request {
+  const init: RequestInit = {
+    body: request.body,
+    headers,
+    method: request.method,
+  };
+  if (request.body) {
+    (init as Record<string, unknown>).duplex = "half";
+  }
+  return new Request(url, init);
+}
+
+async function proxyToAgent(request: Request, env: Env, sessionId: string, path: string, extraHeaders?: HeadersInit, ownerEmail?: string): Promise<Response> {
+  const agent = await getAgentByName(env.CODING_AGENT as never, sessionId);
+  const headers = new Headers(request.headers);
+  headers.set("x-dodo-session-id", sessionId);
+
+  // Always propagate the owner email so the DO can reconcile identity drift
+  // and clear stale OAuth MCPs when the calling user changes. Callers pass
+  // this explicitly (from the Access JWT) so we never rely on client-set
+  // headers for identity.
+  if (ownerEmail) {
+    headers.set("x-owner-email", ownerEmail);
+  }
+
+  if (extraHeaders) {
+    new Headers(extraHeaders).forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+
+  return agent.fetch(proxyRequest(`https://coding-agent${path}`, request, headers));
+}
+
+async function proxyToUserControl(env: Env, email: string, path: string, init?: RequestInit): Promise<Response> {
+  const stub = getUserControlStub(env, email);
+  const headers = new Headers(init?.headers);
+  headers.set("x-owner-email", email);
+  return stub.fetch(`https://user-control${path}`, { ...init, headers });
+}
+
+async function proxyToSharedIndex(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const stub = getSharedIndexStub(env);
+  return stub.fetch(`https://shared-index${path}`, init);
+}
+
+/** Catalog knownHosts are implicitly allowed (avoids requiring admin to manually allowlist them). */
+const catalogHostnames = new Set(MCP_CATALOG.flatMap((entry) => entry.knownHosts ?? []).map((h) => h.toLowerCase()));
+
+async function isHostAllowed(env: Env, hostname: string): Promise<boolean> {
+  if (catalogHostnames.has(hostname)) return true;
+  const checkRes = await proxyToSharedIndex(env, `/allowlist/check?hostname=${encodeURIComponent(hostname)}`);
+  const checkBody = (await checkRes.json()) as { allowed: boolean };
+  return checkBody.allowed;
+}
+
+function rateLimitedResponse(result: { remaining: number; retryAfter?: number }, route: string, email: string): Response {
+  log("warn", "Rate limit hit", { email, route, retryAfter: result.retryAfter });
+  return Response.json(
+    { error: "Too many requests" },
+    {
+      status: 429,
+      headers: {
+        "Retry-After": String(result.retryAfter ?? 60),
+        "X-RateLimit-Remaining": "0",
+      },
+    },
+  );
+}
+
+async function readConfig(env: Env, email: string): Promise<AppConfig> {
+  const stub = getUserControlStub(env, email);
+  const response = await stub.fetch("https://user-control/config");
+  return (await response.json()) as AppConfig;
+}
+
+/**
+ * Determine the effective permission level for a user on a session.
+ * - Session owner → "admin"
+ * - Admin user → "admin"
+ * - Granted permission via SharedIndex → "readonly" | "readwrite"
+ * - Share cookie guest → permission from signed cookie
+ * - Otherwise → null (no access)
+ */
+type SessionPermissionResult = { permission: PermissionLevel; ownerEmail: string } | null;
+
+async function resolveSessionPermission(
+  env: Env,
+  email: string,
+  sessionId: string,
+  request: Request,
+): Promise<SessionPermissionResult> {
+  // Session owner gets admin
+  const ownerStub = getUserControlStub(env, email);
+  const ownerCheck = await ownerStub.fetch(`https://user-control/sessions/${encodeURIComponent(sessionId)}/check`);
+  if (ownerCheck.ok) return { permission: "admin", ownerEmail: email };
+
+  // Platform admin gets admin
+  if (isAdmin(email, env)) return { permission: "admin", ownerEmail: email };
+
+  // Check SharedIndex for granted permission (includes ownerEmail)
+  const permRes = await proxyToSharedIndex(env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(email)}`);
+  if (permRes.ok) {
+    const perm = (await permRes.json()) as { permission: string; ownerEmail?: string };
+    if (perm.permission === "readwrite") return { permission: "write", ownerEmail: perm.ownerEmail ?? "" };
+    if (perm.permission === "readonly") return { permission: "readonly", ownerEmail: perm.ownerEmail ?? "" };
+  }
+
+  // Check share cookie
+  const cookieSecret = env.COOKIE_SECRET;
+  if (cookieSecret) {
+    const cookieHeader = request.headers.get("Cookie") ?? "";
+    for (const cookie of cookieHeader.split(";")) {
+      const trimmed = cookie.trim();
+      if (trimmed.startsWith("dodo_share=")) {
+        const signedValue = trimmed.slice("dodo_share=".length);
+        const payload = await verifyCookie(signedValue, cookieSecret);
+        if (payload) {
+          try {
+            const parsed = JSON.parse(payload) as { sessionId?: string; permission?: string; ownerEmail?: string; expiresAt?: string };
+            if (parsed.sessionId === sessionId) {
+              if (parsed.expiresAt && new Date(parsed.expiresAt) <= new Date()) continue;
+              const perm: PermissionLevel = parsed.permission === "readwrite" ? "write" : "readonly";
+              return { permission: perm, ownerEmail: parsed.ownerEmail ?? "" };
+            }
+          } catch { /* invalid cookie payload */ }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+const PERMISSION_LEVELS: Record<string, number> = { readonly: 0, readwrite: 1, write: 1, admin: 2 };
+
+/**
+ * Check if the current session permission meets the required level.
+ * Returns a 403 Response if insufficient, or null if OK.
+ */
+export function requirePermission(
+  c: { get: (key: string) => unknown; json: (data: unknown, status?: number) => Response },
+  required: "readonly" | "write" | "admin",
+): Response | null {
+  const perm = c.get("sessionPermission") as string;
+  if ((PERMISSION_LEVELS[perm] ?? -1) < (PERMISSION_LEVELS[required] ?? 999)) {
+    return c.json({ error: "Insufficient permission" }, 403);
+  }
+  return null;
+}
+
+// ─── MCP (token auth, no CF Access) ───
+
+const MAX_MCP_DEPTH = 3;
+
+/** Escape HTML special chars so user-supplied strings can't break out of markup. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Timing-safe string comparison for secret tokens.
+ * Avoids leaking secret length / prefix via comparison timing.
+ * Returns false for different-length strings (length leak is unavoidable
+ * but less sensitive than content comparison).
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const aBytes = new TextEncoder().encode(a);
+  const bBytes = new TextEncoder().encode(b);
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i++) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+/**
+ * Resolve an incoming MCP Bearer token to a user email.
+ *
+ * First tries the global SharedIndex token → email pointer (for user-scoped
+ * `dodo_*` tokens). Falls back to the shared `DODO_MCP_TOKEN` (service mode,
+ * resolves to ADMIN_EMAIL) for CI/service callers.
+ *
+ * Returns null if the token matches nothing.
+ */
+async function resolveMcpToken(env: Env, token: string): Promise<{ email: string; serviceMode: boolean } | null> {
+  if (token.startsWith("dodo_")) {
+    try {
+      const res = await proxyToSharedIndex(env, `/mcp-token-index/${encodeURIComponent(token)}`, { method: "GET" });
+      if (res.ok) {
+        const row = (await res.json()) as { email: string | null };
+        if (row.email) {
+          return { email: row.email, serviceMode: false };
+        }
+      }
+    } catch (err) {
+      log("warn", "mcp token lookup via SharedIndex failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  if (env.DODO_MCP_TOKEN && timingSafeEqual(token, env.DODO_MCP_TOKEN)) {
+    const admin = resolveAdminEmail(env);
+    if (admin) {
+      return { email: admin, serviceMode: true };
+    }
+  }
+
+  return null;
+}
+
+app.all("/mcp", async (c) => {
+  const authHeader = c.req.header("Authorization") ?? "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  const resolved = await resolveMcpToken(c.env, token);
+  if (!resolved) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  c.set("userEmail", resolved.email);
+  c.set("mcpServiceMode", resolved.serviceMode);
+
+  const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
+  if (depth >= MAX_MCP_DEPTH) {
+    return c.json({ error: "MCP recursion depth exceeded" }, 429);
+  }
+
+  const server = createDodoMcpServer(c.env, resolved.email, depth);
+  const handler = createMcpHandler(server);
+  return handler(c.req.raw, c.env, c.executionCtx);
+});
+
+// Code-mode MCP: 2 tools (search + execute) instead of 40+.
+// Use this endpoint for MCP connections from coding agents to minimize context usage.
+app.all("/mcp/codemode", async (c) => {
+  const authHeader = c.req.header("Authorization") ?? "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  const resolved = await resolveMcpToken(c.env, token);
+  if (!resolved) {
+    return c.json({ error: "Invalid or missing MCP token" }, 401);
+  }
+
+  c.set("userEmail", resolved.email);
+  c.set("mcpServiceMode", resolved.serviceMode);
+
+  const depth = parseInt(c.req.header("x-dodo-mcp-depth") ?? "0", 10) || 0;
+  if (depth >= MAX_MCP_DEPTH) {
+    return c.json({ error: "MCP recursion depth exceeded" }, 429);
+  }
+
+  // Pass the resolved user email so codemode operations run with the
+  // calling user's identity instead of falling back to admin via
+  // resolveAdminEmail (audit finding H2). This keeps per-user secrets,
+  // session ACLs, and outbound auth scoped to the real caller.
+  const server = createDodoCodeModeMcpServer(c.env, resolved.email, depth);
+  // createMcpHandler defaults route to "/mcp" and rejects anything else with
+  // 404 — pass the actual mounted route so POSTs to /mcp/codemode are accepted.
+  const handler = createMcpHandler(server, { route: "/mcp/codemode" });
+  return handler(c.req.raw, c.env, c.executionCtx);
+});
+
+// ─── Health (no auth) ───
+
+app.get("/health", (c) => c.json({ status: "ok" }));
+
+
+
+// ─── Bootstrap (one-time, only works when no users exist) ───
+
+app.post("/api/bootstrap", async (c) => {
+  const stub = getSharedIndexStub(c.env);
+  const usersResp = await stub.fetch("https://shared-index/users");
+  const { users } = (await usersResp.json()) as { users: unknown[] };
+  if (users.length > 0) {
+    return c.json({ error: "Already bootstrapped — users exist" }, 409);
+  }
+  const adminEmail = resolveAdminEmail(c.env);
+  if (!adminEmail) {
+    return c.json({ error: "ADMIN_EMAIL not configured" }, 500);
+  }
+  const addResp = await stub.fetch("https://shared-index/users", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: adminEmail, role: "admin" }),
+  });
+  if (!addResp.ok) {
+    return c.json({ error: "Failed to seed admin user" }, 500);
+  }
+  // Log loud — bootstrap is a one-time privileged action and we want it
+  // visible if it ever fires unexpectedly. (audit finding M13)
+  log("warn", "Bootstrap: admin user seeded", {
+    email: adminEmail,
+    ip: c.req.header("cf-connecting-ip") ?? "unknown",
+  });
+  return c.json({ bootstrapped: true, adminEmail }, 201);
+});
+
+// ─── Share link redemption (no auth required) ───
+
+app.get("/shared/:token", async (c) => {
+  const token = c.req.param("token");
+  const verifyRes = await proxyToSharedIndex(c.env, "/shares/verify", {
+    body: JSON.stringify({ token }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  const result = (await verifyRes.json()) as { valid: boolean; sessionId?: string; permission?: string; ownerEmail?: string };
+  if (!result.valid || !result.sessionId) {
+    return c.json({ error: "Invalid or expired share link" }, 403);
+  }
+
+  const cookieSecret = c.env.COOKIE_SECRET;
+  if (!cookieSecret) {
+    return c.json({ error: "Sharing not configured" }, 500);
+  }
+
+  const payload = JSON.stringify({
+    sessionId: result.sessionId,
+    permission: result.permission,
+    ownerEmail: result.ownerEmail,
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+  });
+
+  const signed = await signCookie(payload, cookieSecret);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: `/#session=${encodeURIComponent(result.sessionId)}`,
+      "Set-Cookie": `dodo_share=${signed}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`,
+    },
+  });
+});
+
+// ─── Error ingestion (no auth — errors can happen before/during auth) ───
+
+app.post("/api/errors", async (c) => {
+  const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+  const rl = errorLimiter.check(ip, 30, 3600); // 30 errors per hour per IP
+  if (!rl.allowed) {
+    return c.json({ error: "Too many error reports" }, 429);
+  }
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.message) return c.json({ error: "Missing message" }, 400);
+
+  const stub = getSharedIndexStub(c.env);
+  await stub.fetch("https://shared-index/errors", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message: String(body.message).slice(0, 1000),
+      source: String(body.source ?? "").slice(0, 500),
+      lineno: Number(body.lineno) || 0,
+      colno: Number(body.colno) || 0,
+      stack: String(body.stack ?? "").slice(0, 5000),
+      userAgent: String(body.userAgent ?? "").slice(0, 300),
+      email: String(body.email ?? "").slice(0, 200),
+      url: String(body.url ?? "").slice(0, 500),
+    }),
+  });
+  return c.json({ received: true }, 201);
+});
+
+/**
+ * Check if the request carries a valid, non-expired dodo_share cookie.
+ * Used to let share-link guests bypass the user allowlist.
+ */
+async function checkShareCookie(request: Request, env: Env): Promise<boolean> {
+  const cookieSecret = env.COOKIE_SECRET;
+  if (!cookieSecret) return false;
+  const cookieHeader = request.headers.get("Cookie") ?? "";
+  for (const cookie of cookieHeader.split(";")) {
+    const trimmed = cookie.trim();
+    if (trimmed.startsWith("dodo_share=")) {
+      const signedValue = trimmed.slice("dodo_share=".length);
+      const payload = await verifyCookie(signedValue, cookieSecret);
+      if (payload) {
+        try {
+          const parsed = JSON.parse(payload) as { sessionId?: string; expiresAt?: string };
+          if (!parsed.sessionId) continue;
+          if (parsed.expiresAt && new Date(parsed.expiresAt) <= new Date()) continue;
+          return true;
+        } catch { /* invalid payload */ }
+      }
+    }
+  }
+  return false;
+}
+
+// ─── Auth middleware ───
+
+app.use("*", async (c, next) => {
+  const path = new URL(c.req.raw.url).pathname;
+  if (path === "/health" || path === "/api/bootstrap" || path === "/api/errors" || path === "/mcp" || path.startsWith("/mcp/") || path.startsWith("/shared/")) return next();
+
+  let identity: AccessIdentity;
+  try {
+    identity = await verifyAccess(c.req.raw, c.env);
+  } catch (error) {
+    if (error instanceof AuthError) {
+      log("warn", "Auth failure", { source: "unknown", error: error.message });
+      return c.json({ error: error.message }, error.status as 401 | 403 | 500);
+    }
+    log("warn", "Auth failure", { source: "unknown", error: "Authentication failed" });
+    return c.json({ error: "Authentication failed" }, 403);
+  }
+
+  // Canonicalize the email exactly once, at the auth boundary. Every
+  // downstream call site (UserControl DO routing, isAdmin checks, x-owner-email
+  // header propagation, SharedIndex lookups) reads from c.get("userEmail")
+  // and inherits the canonical form. (audit finding H5)
+  const canonicalEmail = canonicalizeEmail(identity.email);
+  if (!canonicalEmail) {
+    log("warn", "Auth failure", { source: identity.source, error: "No email in token" });
+    return c.json({ error: "No email in token" }, 403);
+  }
+
+  // In dev mode, skip the allowlist check entirely
+  if (!isDevMode(c.env)) {
+    const { allowed } = await checkAllowlist(canonicalEmail, c.env);
+    if (!allowed) {
+      // Share-link guests bypass the allowlist — session-level permissions
+      // are enforced later by the resolveSessionPermission middleware.
+      const hasValidShareCookie = await checkShareCookie(c.req.raw, c.env);
+      if (!hasValidShareCookie) {
+        log("warn", "Auth failure", { email: canonicalEmail, source: identity.source, error: "Not on allowlist" });
+        return c.json({ error: "Not authorized — not on Dodo allowlist" }, 403);
+      }
+      log("info", "Auth: share-cookie guest bypassed allowlist", { email: canonicalEmail });
+    }
+  }
+
+  log("info", "Auth success", { email: canonicalEmail, source: identity.source });
+  // Store the canonical identity so all downstream c.get("userEmail") calls
+  // receive a consistent form.
+  c.set("identity", { ...identity, email: canonicalEmail });
+  c.set("userEmail", canonicalEmail);
+
+  // Inject owner email into the incoming request headers so proxyToAgent /
+  // proxyToUserControl forwarders can propagate it to DOs without every
+  // call site needing to thread it manually. The DO uses this to detect
+  // Access identity drift and clear stale OAuth MCP connections.
+  const mutable = new Headers(c.req.raw.headers);
+  mutable.set("x-owner-email", canonicalEmail);
+  c.req.raw = new Request(c.req.raw, { headers: mutable });
+
+  return next();
+});
+
+// ─── Cap'n Web RPC (authenticated) ───
+//
+// The RPC surface is bound to the server-authenticated email. There is no
+// client-callable `authenticate(email)` factory — that would let any
+// allowlisted user impersonate any other user via the RPC channel.
+// (audit finding H1)
+
+app.all("/rpc", async (c) => {
+  const api = buildAuthenticatedApi(c.env, c.get("userEmail"));
+  return newRpcResponse(c, api);
+});
+
+// ─── Static assets ───
+
+app.get("/", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(c.req.raw);
+  }
+  return new Response("Dodo", { headers: { "content-type": "text/plain" } });
+});
+
+app.get("/docs", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/docs.html", c.req.url), c.req.raw));
+  }
+  return new Response("Docs not available", { status: 404 });
+});
+
+app.get("/howto", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/howto.html", c.req.url), c.req.raw));
+  }
+  return new Response("How-to guides not available", { status: 404 });
+});
+
+// Admin-only seed cache page. The static HTML is served unconditionally —
+// the API calls behind it are gated by `adminGuard`, so non-admins see
+// 403 errors when the page tries to load data. We don't gate the page
+// itself because the static asset has no sensitive content.
+app.get("/admin/seeds", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-seeds.html", c.req.url), c.req.raw));
+  }
+  return new Response("Seed cache admin page not available", { status: 404 });
+});
+
+// Global system-prompt admin page — same shape as /admin/seeds.
+app.get("/admin/system-prompt", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-system-prompt.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
+app.get("/admin/autopilot", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-autopilot.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
+app.get("/admin/chat-monitors", async (c) => {
+  if (c.env.ASSETS) {
+    return c.env.ASSETS.fetch(new Request(new URL("/admin-chat-monitors.html", c.req.url), c.req.raw));
+  }
+  return new Response("Admin page not available", { status: 404 });
+});
+
+// ─── Admin routes (admin only) ───
+
+const adminGuard = async (c: { get: (key: string) => unknown; env: Env; json: (data: unknown, status?: number) => Response }, next: () => Promise<void>): Promise<Response | void> => {
+  const email = c.get("userEmail") as string;
+  if (!isAdmin(email, c.env)) {
+    return c.json({ error: "Admin access required" }, 403);
+  }
+  return next();
+};
+
+app.get("/api/admin/users", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users"));
+app.post("/api/admin/users", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/users", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }),
+);
+app.delete("/api/admin/users/:email", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}`, { method: "DELETE" }),
+);
+app.post("/api/admin/users/:email/block", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/block`, { method: "POST" }),
+);
+app.delete("/api/admin/users/:email/block", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/block`, { method: "DELETE" }),
+);
+
+// ─── Admin: browser access ───
+app.post("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/browser`, { method: "POST" }),
+);
+app.delete("/api/admin/users/:email/browser", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/users/${encodeURIComponent(c.req.param("email"))}/browser`, { method: "DELETE" }),
+);
+
+app.get("/api/admin/stats", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/stats"));
+
+app.get("/api/admin/users/detailed", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/users/detailed"));
+
+// Admin diagnostic: list a target user's per-user secret KEYS (not values).
+// Per-user secrets are envelope-encrypted with a key derived per user, so
+// even the admin can't decrypt the values — but key names + timestamps
+// are stored as plaintext and are useful for diagnosing setup state
+// ("did user X set their ntfy_topic?", etc.). Privacy-safe: this returns
+// the same shape as `GET /api/secrets` does for the target user, minus
+// any value data.
+app.get("/api/admin/users/:email/secret-keys", adminGuard as never, async (c) => {
+  const targetEmail = decodeURIComponent(c.req.param("email"));
+  return proxyToUserControl(c.env, targetEmail, "/secrets");
+});
+
+// ─── Admin: error monitoring ───
+
+app.get("/api/admin/errors", adminGuard as never, async (c) => {
+  const search = new URL(c.req.raw.url).search;
+  return proxyToSharedIndex(c.env, `/errors${search}`);
+});
+
+app.get("/api/admin/errors/summary", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/errors/summary"));
+
+app.delete("/api/admin/errors", adminGuard as never, async (c) => proxyToSharedIndex(c.env, "/errors", { method: "DELETE" }));
+
+// ─── Admin: health check (manual trigger) ───
+
+app.post("/api/admin/health-check", adminGuard as never, async (c) => {
+  const report = await runHealthCheck(c.env, c.executionCtx);
+  return c.json(report);
+});
+
+// ─── Admin: ChatMonitorAgent PoC ───
+//
+// Per-(owner,space) Google Chat poll-decide-reply loop, backed by a
+// Durable Object alarm. See src/chat-monitor-agent.ts.
+//
+// Routes (all admin-only):
+//   POST   /api/admin/chat-monitor                    create/update
+//   POST   /api/admin/chat-monitor/:owner/:space/start
+//   POST   /api/admin/chat-monitor/:owner/:space/stop
+//   POST   /api/admin/chat-monitor/:owner/:space/tick   (one-shot debug fire)
+//   GET    /api/admin/chat-monitor/:owner/:space
+//   DELETE /api/admin/chat-monitor/:owner/:space
+//
+// `:space` is URL-encoded form of the full `spaces/AAAA...` resource name.
+
+function chatMonitorStub(env: Env, ownerEmail: string, spaceId: string) {
+  const id = env.CHAT_MONITOR.idFromName(chatMonitorIdName(ownerEmail, spaceId));
+  return env.CHAT_MONITOR.get(id);
+}
+
+app.post("/api/admin/chat-monitor", adminGuard as never, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = createMonitorSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: "invalid body", issues: parsed.error.issues }, 400);
+  }
+  const stub = chatMonitorStub(c.env, parsed.data.ownerEmail, parsed.data.spaceId);
+  const res = await stub.fetch("https://chat-monitor/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(parsed.data),
+  });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.get("/api/admin/chat-monitor", adminGuard as never, async (c) => {
+  // Global list from SharedIndex registry.
+  return proxyToSharedIndex(c.env, "/chat-monitors");
+});
+
+app.get("/api/admin/chat-monitor/:owner/:space/forwards", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const limit = c.req.query("limit");
+  const qs = limit ? `?limit=${encodeURIComponent(limit)}` : "";
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch(`https://chat-monitor/forwards${qs}`);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.get("/api/admin/chat-monitor/:owner/:space", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/state");
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.post("/api/admin/chat-monitor/:owner/:space/start", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/start", { method: "POST" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.post("/api/admin/chat-monitor/:owner/:space/stop", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/stop", { method: "POST" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+app.post("/api/admin/chat-monitor/:owner/:space/tick", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/tick", { method: "POST" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+
+
+app.delete("/api/admin/chat-monitor/:owner/:space", adminGuard as never, async (c) => {
+  const owner = decodeURIComponent(c.req.param("owner"));
+  const space = decodeURIComponent(c.req.param("space"));
+  const stub = chatMonitorStub(c.env, owner, space);
+  const res = await stub.fetch("https://chat-monitor/", { method: "DELETE" });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+});
+
+// ─── Admin: autopilot self-diagnose kickoff ───
+//
+// Creates a fresh session owned by the admin, marks it as an autopilot
+// worker, seeds the diagnose prompt, and returns the session id. The LLM
+// runs in the background (fiber-backed async prompt) — the admin can pop
+// open the session in the UI and watch it work.
+
+// Autopilot kickoff is now a thin convenience wrapper over the generic
+// goal-driven session flow:
+//
+//   1. POST /session         — make a session
+//   2. PUT  /session/:id/goal — set the diagnose goal
+//   3. POST /session/:id/prompt — send "Begin." (the goal section in the
+//      system prompt carries the actual instructions)
+//
+// The session self-continues until the model calls set_goal_status. This
+// endpoint stays only because it does (1)+(2)+(3) atomically and tags the
+// session for the admin UI. A user could do the same three calls manually.
+app.post("/api/admin/autopilot/kickoff", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const body = await c.req.raw.json().catch(() => ({})) as {
+    targetArea?: string;
+    contextNotes?: string;
+    sinceHours?: number;
+    maxTurns?: number;
+  };
+
+  const { buildDiagnoseGoal, resolveAutopilotOwner } = await import("./autopilot");
+  let owner: string;
+  try {
+    owner = resolveAutopilotOwner(c.env);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
+  }
+  if (adminEmail.toLowerCase() !== owner) {
+    return c.json({ error: "Only the configured ADMIN_EMAIL can kick off autopilot" }, 403);
+  }
+
+  const sessionId = crypto.randomUUID();
+  const createRes = await proxyToUserControl(c.env, owner, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: owner, createdBy: owner }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text().catch(() => "");
+    return c.json({ error: `Failed to create autopilot session: ${text}` }, 500);
+  }
+
+  const agentStub = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
+  await agentStub.fetch(`https://coding-agent/autopilot-flag`, {
+    body: JSON.stringify({ isAutopilot: true, role: "worker-manual" }),
+    headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+    method: "PUT",
+  });
+
+  const title = `[autopilot] ${body.targetArea ?? "diagnose " + new Date().toISOString().slice(0, 16)}`;
+  await proxyToUserControl(c.env, owner, `/sessions/${encodeURIComponent(sessionId)}`, {
+    body: JSON.stringify({ title }),
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+
+  // Set the goal — the diagnose template becomes goal text, NOT a prompt.
+  // The model sees it every turn via the system prompt's goal section.
+  const goalText = buildDiagnoseGoal({
+    targetArea: body.targetArea,
+    contextNotes: body.contextNotes,
+    sinceHours: body.sinceHours ?? 24,
+  });
+  await agentStub.fetch("https://coding-agent/goal", {
+    body: JSON.stringify({ text: goalText, maxTurns: body.maxTurns ?? 50, role: "autopilot-worker" }),
+    headers: { "content-type": "application/json", "x-dodo-session-id": sessionId, "x-owner-email": owner },
+    method: "PUT",
+  });
+
+  // Kick off with a short trigger prompt. The model already has the full
+  // goal in its system prompt; this is just "go."
+  const ownerConfigRes = await readConfig(c.env, owner);
+  const promptRes = await agentStub.fetch(`https://coding-agent/prompt`, {
+    body: JSON.stringify({ content: "Begin." }),
+    headers: {
+      "content-type": "application/json",
+      "x-dodo-session-id": sessionId,
+      "x-owner-email": owner,
+      "x-author-email": owner,
+      "x-dodo-ai-base-url": ownerConfigRes.aiGatewayBaseURL,
+      "x-dodo-gateway": ownerConfigRes.activeGateway,
+      "x-dodo-model": ownerConfigRes.model,
+      "x-dodo-opencode-base-url": ownerConfigRes.opencodeBaseURL,
+    },
+    method: "POST",
+  });
+  if (!promptRes.ok) {
+    const text = await promptRes.text().catch(() => "");
+    log("warn", "autopilot kickoff: prompt rejected", { sessionId, body: text.slice(0, 200) });
+    return c.json({ id: sessionId, warning: `Session + goal created but initial prompt failed: ${text.slice(0, 200)}` }, 201);
+  }
+
+  log("info", "Autopilot worker kicked off", { sessionId, targetArea: body.targetArea ?? null });
+  return c.json({ id: sessionId, ownerEmail: owner, title }, 201);
+});
+
+// ─── Admin: autopilot supervisor schedule ───
+//
+// Installs (or replaces) a scheduled supervisor session that fires on a
+// cron and decides whether to dispatch worker sessions. The supervisor is
+// a regular scheduled session under the hood — we just hand it the
+// supervisor prompt template and tag it as autopilot when it spawns.
+
+const AUTOPILOT_SUPERVISOR_DESC = "Dodo autopilot supervisor";
+
+app.get("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const res = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (!res.ok) return c.json({ error: `Failed to list schedules: ${res.status}` }, 500);
+  const body = (await res.json()) as { scheduledSessions?: Array<{ id: string; description: string; cron_expression?: string; next_run_epoch?: number; last_run_epoch?: number }> };
+  const supervisor = (body.scheduledSessions ?? []).find((s) => s.description === AUTOPILOT_SUPERVISOR_DESC);
+  return c.json({ supervisor: supervisor ?? null });
+});
+
+app.post("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const body = (await c.req.raw.json().catch(() => ({}))) as { cron?: string; sinceHours?: number };
+  const cron = (body.cron ?? "0 */12 * * *").trim();
+  const sinceHours = body.sinceHours ?? 12;
+
+  const { buildSupervisorPrompt, resolveAutopilotOwner } = await import("./autopilot");
+  try {
+    const owner = resolveAutopilotOwner(c.env);
+    if (adminEmail.toLowerCase() !== owner) {
+      return c.json({ error: "Only the configured ADMIN_EMAIL can install the supervisor" }, 403);
+    }
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : "Autopilot unavailable" }, 500);
+  }
+
+  // Remove any existing supervisor — keeps a single schedule per admin.
+  const existingRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (existingRes.ok) {
+    const existing = (await existingRes.json()) as { scheduledSessions?: Array<{ id: string; description: string }> };
+    for (const s of existing.scheduledSessions ?? []) {
+      if (s.description === AUTOPILOT_SUPERVISOR_DESC) {
+        await proxyToUserControl(c.env, adminEmail, `/scheduled-sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+      }
+    }
+  }
+
+  const payload = {
+    description: AUTOPILOT_SUPERVISOR_DESC,
+    prompt: buildSupervisorPrompt({ sinceHours }),
+    type: "cron" as const,
+    cron,
+    source: "fresh" as const,
+    title: "[autopilot supervisor]",
+    createdBy: adminEmail,
+  };
+
+  const createRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions", {
+    body: JSON.stringify(payload),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text().catch(() => "");
+    return c.json({ error: `Failed to install supervisor: ${text}` }, 500);
+  }
+  const created = await createRes.json();
+  return c.json({ installed: true, schedule: created }, 201);
+});
+
+app.delete("/api/admin/autopilot/supervisor", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const existingRes = await proxyToUserControl(c.env, adminEmail, "/scheduled-sessions");
+  if (!existingRes.ok) return c.json({ error: `Failed to list schedules: ${existingRes.status}` }, 500);
+  const existing = (await existingRes.json()) as { scheduledSessions?: Array<{ id: string; description: string }> };
+  let removed = 0;
+  for (const s of existing.scheduledSessions ?? []) {
+    if (s.description === AUTOPILOT_SUPERVISOR_DESC) {
+      await proxyToUserControl(c.env, adminEmail, `/scheduled-sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+      removed++;
+    }
+  }
+  return c.json({ removed });
+});
+
+app.get("/api/admin/autopilot/workers", adminGuard as never, async (c) => {
+  const adminEmail = c.get("userEmail") as string;
+  const limit = Math.min(Number(c.req.query("limit") ?? 25), 100);
+  const res = await proxyToUserControl(c.env, adminEmail, "/sessions");
+  if (!res.ok) return c.json({ error: `Failed to list sessions: ${res.status}` }, 500);
+  const body = (await res.json()) as { sessions?: Array<{ id: string; title?: string; status?: string; created_at?: number }> };
+  const all = body.sessions ?? [];
+  const autopilot = all
+    .filter((s) => (s.title ?? "").startsWith("[autopilot]"))
+    .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+    .slice(0, limit);
+  return c.json({ count: autopilot.length, sessions: autopilot });
+});
+
+// ─── Admin: global system-prompt prefix ───
+//
+// A preamble prepended to the system prompt for every session across every
+// user. Capped at 4 KB on the SharedIndex side. Sessions pick up changes on
+// the next prompt turn (60-second TTL cache in CodingAgent).
+
+app.get("/api/admin/global-system-prompt", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix"),
+);
+
+app.put("/api/admin/global-system-prompt", adminGuard as never, async (c) => {
+  const body = (await c.req.json()) as { value?: string };
+  const updatedBy = c.get("userEmail") as string;
+  if (typeof body.value !== "string") {
+    return c.json({ error: "value (string) required" }, 400);
+  }
+  return proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix", {
+    body: JSON.stringify({ value: body.value, updatedBy }),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/admin/global-system-prompt", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/global-config/system_prompt_prefix", { method: "DELETE" }),
+);
+
+// Approved-MCPs admin routes use the shared `adminGuard` middleware so the
+// admin gate is applied consistently with every other /api/admin/* route.
+// (audit follow-up F7 — was previously inline `isAdmin` checks.)
+app.get("/api/admin/approved-mcps", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/approved-mcps", { method: "GET" });
+});
+
+app.post("/api/admin/approved-mcps", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.clone().text();
+  return proxyToUserControl(c.env, email, "/approved-mcps", { method: "POST", headers: { "content-type": "application/json" }, body });
+});
+
+app.put("/api/admin/approved-mcps/:url", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.clone().text();
+  return proxyToUserControl(c.env, email, `/approved-mcps/${encodeURIComponent(c.req.param("url"))}`, { method: "PUT", headers: { "content-type": "application/json" }, body });
+});
+
+app.delete("/api/admin/approved-mcps/:url", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/approved-mcps/${encodeURIComponent(c.req.param("url"))}`, { method: "DELETE" });
+});
+
+app.get("/api/admin/sessions", adminGuard as never, async (c) => {
+  // Fetch all registered users from SharedIndex
+  const usersRes = await proxyToSharedIndex(c.env, "/users");
+  const { users } = (await usersRes.json()) as { users: Array<{ email: string }> };
+
+  // Query each user's UserControl for their sessions
+  const allSessions: Array<Record<string, unknown>> = [];
+  await Promise.all(
+    users.map(async (user) => {
+      try {
+        const sessionsRes = await proxyToUserControl(c.env, user.email, "/sessions");
+        if (!sessionsRes.ok) return;
+        const { sessions } = (await sessionsRes.json()) as { sessions: Array<Record<string, unknown>> };
+        for (const session of sessions) {
+          allSessions.push({ ...session, ownerEmail: user.email });
+        }
+      } catch {
+        // Skip users whose UserControl is unavailable
+      }
+    }),
+  );
+
+  // Sort by updatedAt descending
+  allSessions.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  return c.json({ sessions: allSessions });
+});
+
+// ─── Admin: seed-session cache ───
+//
+// The seed cache holds admin-owned warm clones of known repos so user
+// runs can fork instead of cloning fresh. Cleanup is manual: seeds never
+// auto-expire. The admin UI (/admin/seeds.html) drives these endpoints.
+
+app.get("/api/admin/seeds", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/seeds"),
+);
+
+app.delete("/api/admin/seeds/:repoId/:baseBranch", adminGuard as never, async (c) => {
+  const repoId = c.req.param("repoId");
+  const baseBranch = c.req.param("baseBranch");
+  // Look up the seed first so we know which UserControl + session to
+  // delete the underlying clone from. Without this the registry row
+  // disappears but the seed session lingers forever.
+  const seedRes = await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  if (seedRes.ok) {
+    const { seed } = (await seedRes.json()) as { seed: { sessionId: string; ownerEmail: string } };
+    try {
+      await proxyToUserControl(c.env, seed.ownerEmail, `/sessions/${encodeURIComponent(seed.sessionId)}`, { method: "DELETE" });
+    } catch (err) {
+      // Underlying session deletion is best-effort. Failures here leave
+      // an orphan session row, but the registry will be cleared so the
+      // next call cold-clones a new seed instead of reusing the stale one.
+      log("warn", "admin: failed to delete seed session", {
+        repoId, baseBranch, sessionId: seed.sessionId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`, { method: "DELETE" });
+});
+
+app.post("/api/admin/seeds/:repoId/:baseBranch/refresh", adminGuard as never, async (c) => {
+  const repoId = c.req.param("repoId");
+  const baseBranch = c.req.param("baseBranch");
+  const seedRes = await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  if (!seedRes.ok) {
+    return c.json({ error: "Seed not found", repoId, baseBranch }, 404);
+  }
+  const { seed } = (await seedRes.json()) as { seed: { sessionId: string; ownerEmail: string; repoDir: string } };
+  // Run `git pull` on the seed so subsequent forks pick up upstream
+  // changes. Failures bubble back to the admin UI as a 500 — usually
+  // means upstream is unreachable or the seed's clone is wedged.
+  const agent = await getAgentByName(c.env.CODING_AGENT as never, seed.sessionId);
+  const pullRes = await agent.fetch(new Request("https://coding-agent/git/pull", {
+    body: JSON.stringify({ dir: seed.repoDir, ref: baseBranch, remote: "origin" }),
+    headers: {
+      "content-type": "application/json",
+      "x-dodo-session-id": seed.sessionId,
+      "x-owner-email": seed.ownerEmail,
+    },
+    method: "POST",
+  }));
+  if (!pullRes.ok) {
+    const text = await pullRes.text().catch(() => "");
+    return c.json({ error: `Refresh failed: ${pullRes.status} ${text.slice(0, 200)}`, repoId, baseBranch }, 500);
+  }
+  await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}/touch`, { method: "POST" });
+  const refreshed = await proxyToSharedIndex(c.env, `/seeds/${encodeURIComponent(repoId)}/${encodeURIComponent(baseBranch)}`);
+  return new Response(refreshed.body, { status: refreshed.status, headers: refreshed.headers });
+});
+
+// ─── User config (per-user via UserControl) ───
+
+app.get("/api/config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/config");
+});
+
+app.put("/api/config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/config", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+// ─── Host allowlist (global via SharedIndex) ───
+
+app.get("/api/allowlist", async (c) => proxyToSharedIndex(c.env, "/allowlist"));
+
+app.post("/api/allowlist", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, "/allowlist", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }),
+);
+
+app.delete("/api/allowlist/:hostname", adminGuard as never, async (c) =>
+  proxyToSharedIndex(c.env, `/allowlist/${encodeURIComponent(c.req.param("hostname"))}`, { method: "DELETE" }),
+);
+
+app.get("/api/allowlist/check", async (c) => proxyToSharedIndex(c.env, `/allowlist/check${new URL(c.req.raw.url).search}`));
+
+// ─── Memory (per-user via UserControl) ───
+
+app.get("/api/memory", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory${new URL(c.req.raw.url).search}`);
+});
+
+app.post("/api/memory", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/memory", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.get("/api/memory/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`);
+});
+
+app.put("/api/memory/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/memory/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/memory/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+// ─── Skills (per-user SKILL.md store) ───
+
+app.get("/api/skills", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills${new URL(c.req.raw.url).search}`);
+});
+
+// Merged personal + built-in skill list. Registered BEFORE /api/skills/:name
+// so Hono doesn't route "/api/skills/all" as the GET-by-name handler.
+// Workspace skills are session-scoped (live inside the cloned repo) and are
+// intentionally excluded — they only resolve when the user has a session
+// selected. Surfaced for the Skills sidebar so users can see what their
+// agent knows without diving into the system prompt.
+app.get("/api/skills/all", async (c) => {
+  const email = c.get("userEmail");
+  const personalRes = await proxyToUserControl(c.env, email, "/skills");
+  const personalPayload = await personalRes.json() as { skills?: Array<Record<string, unknown>> };
+  const personal = (personalPayload.skills ?? []).map((s) => ({
+    name: String(s.name),
+    description: String(s.description ?? ""),
+    enabled: s.enabled !== false,
+    source: "personal" as const,
+  }));
+  const { listBuiltinSkills } = await import("./builtin-skills");
+  const builtin = listBuiltinSkills().map((s) => ({
+    name: s.name,
+    description: s.description,
+    enabled: true,
+    source: "builtin" as const,
+  }));
+  const personalNames = new Set(personal.map((s) => s.name));
+  // Sort mirrors mergeSkills() in src/skill-registry.ts: personal (rank 0)
+  // before builtin (rank 2), alphabetical inside each block. The UI groups
+  // by source after the fact, but other consumers (docs, mcp) get the same
+  // shape the system prompt manifest uses.
+  const sourceRank = (s: "personal" | "builtin") => (s === "personal" ? 0 : 2);
+  const merged = [
+    ...personal,
+    ...builtin.filter((s) => !personalNames.has(s.name)),
+  ].sort(
+    (a, b) => sourceRank(a.source) - sourceRank(b.source) || a.name.localeCompare(b.name),
+  );
+  return c.json({ skills: merged });
+});
+
+app.post("/api/skills", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/skills", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.get("/api/skills/:name", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`);
+});
+
+app.put("/api/skills/:name", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.put("/api/skills/:name/enabled", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}/enabled`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/skills/:name", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/skills/${encodeURIComponent(c.req.param("name"))}`, {
+    method: "DELETE",
+  });
+});
+
+// ─── Tool catalog (static, for UI surfacing) ───
+
+app.get("/api/tool-catalog", async (c) => {
+  const { getOrchestratorToolCatalog } = await import("./tool-catalog");
+  return c.json({
+    orchestrator: getOrchestratorToolCatalog(),
+  });
+});
+
+// ─── Models (global via SharedIndex) ───
+
+app.get("/api/models", async (c) => proxyToSharedIndex(c.env, `/models${new URL(c.req.raw.url).search}`));
+
+// ─── Status (per-user) ───
+
+app.get("/api/status", async (c) => {
+  const email = c.get("userEmail");
+  const res = await proxyToUserControl(c.env, email, "/status");
+  // Inject commit hash from Worker env — DOs may not receive --var overrides
+  const data = await res.json() as Record<string, unknown>;
+  data.commit = c.env.DODO_COMMIT ?? data.commit ?? "";
+  return Response.json(data);
+});
+
+// ─── Tasks (per-user via UserControl) ───
+
+app.get("/api/tasks", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks${new URL(c.req.raw.url).search}`);
+});
+
+app.post("/api/tasks", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/tasks", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+// Batch dispatch: dispatch multiple tasks in parallel (must be before :id routes)
+app.post("/api/tasks/batch-dispatch", async (c) => {
+  const email = c.get("userEmail");
+  const body = (await c.req.json()) as { taskIds?: string[] };
+  const taskIds = body.taskIds;
+  if (!Array.isArray(taskIds) || taskIds.length === 0 || taskIds.length > 10) {
+    return c.json({ error: "taskIds must be an array of 1-10 task IDs" }, 400);
+  }
+  // Charge the prompt limiter for the whole batch up front. Without this,
+  // a single batch-dispatch call burned 10× the per-prompt quota with no
+  // hard cap on per-user LLM spend. (audit finding M6/M7)
+  for (let i = 0; i < taskIds.length; i++) {
+    const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+    if (!rl.allowed) return rateLimitedResponse(rl, "prompt-batch", email);
+  }
+
+  // Fetch all tasks
+  const listRes = await proxyToUserControl(c.env, email, "/tasks");
+  const listBody = (await listRes.json()) as { tasks: Array<{ id: string; title: string; description: string; priority: string; status: string; sessionId: string | null }> };
+  const taskMap = new Map(listBody.tasks.map((t) => [t.id, t]));
+
+  const config = await readConfig(c.env, email);
+  const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+  const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+  const effectiveOwner = checkBody.hasCreate && checkBody.accountOwner ? checkBody.accountOwner : email;
+
+  const results: Array<{ taskId: string; sessionId?: string; error?: string }> = [];
+
+  for (const taskId of taskIds) {
+    const task = taskMap.get(taskId);
+    if (!task) { results.push({ taskId, error: "not found" }); continue; }
+    if (task.status === "in_progress" || task.status === "done") { results.push({ taskId, error: `already ${task.status}` }); continue; }
+
+    try {
+      const sessionId = crypto.randomUUID();
+      await proxyToUserControl(c.env, effectiveOwner, "/sessions", {
+        body: JSON.stringify({ id: sessionId, ownerEmail: effectiveOwner, createdBy: email }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      if (effectiveOwner !== email) {
+        await proxyToSharedIndex(c.env, "/permissions", {
+          body: JSON.stringify({ sessionId, ownerEmail: effectiveOwner, granteeEmail: email, permission: "readwrite", grantedBy: "system" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        });
+      }
+      await proxyToSharedIndex(c.env, "/stats/increment", {
+        body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+
+      const lines = [`# Task: ${task.title}`];
+      if (task.description) lines.push("", task.description);
+      lines.push("", `Priority: ${task.priority}`, "", "Complete this task. When finished, summarize what you did.");
+
+      const promptReq = new Request(`https://dodo.example/session/${sessionId}/prompt`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: lines.join("\n") }),
+      });
+      await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
+        "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+        "x-dodo-gateway": config.activeGateway,
+        "x-dodo-model": config.model,
+        "x-dodo-opencode-base-url": config.opencodeBaseURL,
+        "x-author-email": email,
+        "x-owner-email": email,
+      });
+
+      await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}`, {
+        body: JSON.stringify({ status: "in_progress", session_id: sessionId }),
+        headers: { "content-type": "application/json" },
+        method: "PUT",
+      });
+
+      results.push({ taskId, sessionId });
+    } catch {
+      results.push({ taskId, error: "dispatch failed" });
+    }
+  }
+
+  log("info", "Batch dispatch", { email, count: taskIds.length, dispatched: results.filter((r) => r.sessionId).length });
+  return c.json({ results });
+});
+
+app.put("/api/tasks/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/tasks/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+app.get("/api/tasks/:id/check", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(c.req.param("id"))}/check`);
+});
+
+// Dispatch a task: create a session, send a prompt, link them together
+app.post("/api/tasks/:id/dispatch", async (c) => {
+  const email = c.get("userEmail");
+  const taskId = c.req.param("id");
+
+  // Per-task dispatch counts against the same per-user prompt budget as the
+  // interactive `/session/:id/prompt` route. (audit finding M6/M7)
+  const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "prompt-dispatch", email);
+
+  // 1. Fetch the task
+  const taskRes = await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}/check`);
+  if (!taskRes.ok) return c.json({ error: "Task not found" }, 404);
+
+  // Get full task data via list + filter (check only returns {found:true})
+  const listRes = await proxyToUserControl(c.env, email, "/tasks");
+  const listBody = (await listRes.json()) as { tasks: Array<{ id: string; title: string; description: string; priority: string; status: string; sessionId: string | null }> };
+  const task = listBody.tasks.find((t) => t.id === taskId);
+  if (!task) return c.json({ error: "Task not found" }, 404);
+
+  // 2. Create a new session
+  const sessionId = crypto.randomUUID();
+  const ownerEmail = email;
+  const createdBy = email;
+
+  // Check for delegation (same logic as POST /session)
+  const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+  const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+  const effectiveOwner = checkBody.hasCreate && checkBody.accountOwner ? checkBody.accountOwner : ownerEmail;
+
+  await proxyToUserControl(c.env, effectiveOwner, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail: effectiveOwner, createdBy }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+
+  // Auto-grant write if delegated
+  if (effectiveOwner !== email) {
+    await proxyToSharedIndex(c.env, "/permissions", {
+      body: JSON.stringify({
+        sessionId,
+        ownerEmail: effectiveOwner,
+        granteeEmail: email,
+        permission: "readwrite",
+        grantedBy: "system",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+  }
+
+  await proxyToSharedIndex(c.env, "/stats/increment", {
+    body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+
+  // 3. Build a richer prompt
+  const lines = [`# Task: ${task.title}`];
+  if (task.description) lines.push("", task.description);
+  lines.push("", `Priority: ${task.priority}`);
+  lines.push("", "Complete this task. When finished, summarize what you did.");
+
+  // 4. Send the prompt to the new session
+  const config = await readConfig(c.env, email);
+  const promptReq = new Request(`https://dodo.example/session/${sessionId}/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: lines.join("\n") }),
+  });
+  await proxyToAgent(promptReq, c.env, sessionId, "/prompt", {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    "x-author-email": email,
+    "x-owner-email": email,
+  });
+
+  // 5. Update task: set status to in_progress and link session
+  await proxyToUserControl(c.env, email, `/tasks/${encodeURIComponent(taskId)}`, {
+    body: JSON.stringify({ status: "in_progress", session_id: sessionId }),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+
+  log("info", "Task dispatched", { email, taskId, sessionId });
+  return c.json({ sessionId, taskId, status: "in_progress" });
+});
+
+// ─── Secrets (per-user via UserControl) ───
+
+app.get("/api/secrets", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/secrets");
+});
+
+app.put("/api/secrets/:key", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/secrets/:key", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}`, { method: "DELETE" });
+});
+
+app.get("/api/secrets/:key/test", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/secrets/${encodeURIComponent(c.req.param("key"))}/test`);
+});
+
+// ─── MCP Configs (per-user via UserControl) ───
+
+app.get("/api/user/mcp-tokens", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/user-mcp-tokens", {
+    method: "GET",
+    headers: { "x-owner-email": email },
+  });
+});
+
+app.post("/api/user/mcp-tokens", async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.clone().text();
+  const parsed = body ? JSON.parse(body) as { label?: string } : {};
+  return proxyToUserControl(c.env, email, "/user-mcp-tokens", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, label: parsed.label }),
+  });
+});
+
+app.delete("/api/user/mcp-tokens/:token", async (c) => {
+  const email = c.get("userEmail");
+  const token = c.req.param("token");
+  return proxyToUserControl(c.env, email, `/user-mcp-tokens/${encodeURIComponent(token)}`, {
+    method: "DELETE",
+    headers: { "x-owner-email": email },
+  });
+});
+
+app.get("/api/mcp-configs", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/mcp-configs");
+});
+
+app.post("/api/mcp-configs", async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.text();
+  // Validate URL hostname against host allowlist + catalog
+  try {
+    const parsed = JSON.parse(body) as { url?: string };
+    if (parsed.url) {
+      const hostname = new URL(parsed.url).hostname.toLowerCase();
+      if (!(await isHostAllowed(c.env, hostname))) {
+        return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
+      }
+    }
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+    if (!(e instanceof TypeError)) throw e;
+  }
+  return proxyToUserControl(c.env, email, "/mcp-configs", {
+    body,
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.put("/api/mcp-configs/:id", async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.text();
+  // Validate URL hostname against host allowlist + catalog
+  try {
+    const parsed = JSON.parse(body) as { url?: string };
+    if (parsed.url) {
+      const hostname = new URL(parsed.url).hostname.toLowerCase();
+      if (!(await isHostAllowed(c.env, hostname))) {
+        return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
+      }
+    }
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+    if (!(e instanceof TypeError)) throw e;
+  }
+  return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}`, {
+    body,
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+app.delete("/api/mcp-configs/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}`, { method: "DELETE" });
+});
+
+app.post("/api/mcp-configs/:id/test", async (c) => {
+  const email = c.get("userEmail");
+  // Fetch config to check URL against allowlist before testing connection
+  const configRes = await proxyToUserControl(c.env, email, "/mcp-configs");
+  if (configRes.ok) {
+    const configBody = (await configRes.json()) as { configs: Array<{ id: string; url?: string }> };
+    const config = configBody.configs.find((cfg) => cfg.id === c.req.param("id"));
+    if (config?.url) {
+      try {
+        const hostname = new URL(config.url).hostname.toLowerCase();
+        if (!(await isHostAllowed(c.env, hostname))) {
+          return c.json({ error: `Host "${hostname}" is not on the allowlist` }, 403);
+        }
+      } catch (e) {
+        if (e instanceof TypeError) {
+          return c.json({ error: "Invalid MCP config URL" }, 400);
+        }
+        throw e;
+      }
+    }
+  }
+  return proxyToUserControl(c.env, email, `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/test`, { method: "POST" });
+});
+
+// Force-refresh the OAuth access token for a refresh_token MCP config.
+// Useful when the cached token has expired in some other way (revoked
+// server-side, clock drift) and the user wants to retry without waiting
+// for the next 401. UI surfaces this as a "Refresh token" button on
+// refresh_token integrations.
+app.post("/api/mcp-configs/:id/refresh-token", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(
+    c.env,
+    email,
+    `/mcp-configs/${encodeURIComponent(c.req.param("id"))}/access-token?force=1`,
+  );
+});
+
+// OAuth success redirect — shown to the user after MCP OAuth completes.
+// The Agents SDK redirects here once token exchange finishes. Points the
+// browser back to the app root with a query flag the UI can react to.
+app.get("/mcp-oauth-success", (c) => {
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MCP connected — Dodo</title>
+  <meta http-equiv="refresh" content="1;url=/?mcp=connected">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { font-size: 1.5rem; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>MCP connected</h1>
+  <p>The OAuth handshake completed. Redirecting you back to Dodo…</p>
+  <p><a href="/?mcp=connected">Return to Dodo</a> if the redirect doesn't happen automatically.</p>
+</body>
+</html>`);
+});
+
+app.get("/mcp-oauth-error", (c) => {
+  const error = new URL(c.req.url).searchParams.get("error") ?? "unknown";
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MCP connection failed — Dodo</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { font-size: 1.5rem; color: #b91c1c; }
+    code { background: #f3f4f6; padding: 0.125rem 0.375rem; border-radius: 0.25rem; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>MCP connection failed</h1>
+  <p>The OAuth flow didn't complete. Error: <code>${escapeHtml(error)}</code></p>
+  <p><a href="/">Return to Dodo</a> and try again, or check the MCP server's OAuth configuration.</p>
+</body>
+</html>`, 400);
+});
+
+// OAuth callback route for MCP server auth flows.
+// Uses getAgentByName so the hub DO's `.name` is set via setName before the
+// Agents SDK's OAuth callback handler reads it (workerd#2240).
+app.all("/agents/*", async (c) => {
+  const userEmail = c.get("userEmail");
+  const stub = await getAgentByName(c.env.CODING_AGENT as never, userEmail);
+  const h = new Headers(c.req.raw.headers);
+  h.set("x-owner-email", userEmail);
+  const req = new Request(c.req.raw, { headers: h });
+  return stub.fetch(req);
+});
+
+// Start MCP OAuth flow
+app.post("/api/mcp/start-auth", async (c) => {
+  let body: { mcpUrl?: string };
+  try {
+    body = await c.req.json<{ mcpUrl: string }>();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const mcpUrl = body.mcpUrl;
+  if (!mcpUrl || typeof mcpUrl !== "string") {
+    return c.json({ error: "mcpUrl required" }, 400);
+  }
+
+  // Validate URL shape before we spin up a DO and start the OAuth handshake
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(mcpUrl);
+  } catch {
+    return c.json({ error: "mcpUrl must be a valid absolute URL" }, 400);
+  }
+  if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+    return c.json({ error: "mcpUrl must use http or https" }, 400);
+  }
+
+  // Gate on the host allowlist — same rule used for /api/mcp-configs. Prevents
+  // users kicking off OAuth dances against arbitrary hostnames.
+  if (!(await isHostAllowed(c.env, parsedUrl.hostname))) {
+    return c.json({ error: "MCP host not on the allowlist" }, 403);
+  }
+
+  const userEmail = c.get("userEmail");
+  // Use getAgentByName so the DO's `.name` is set via setName before any
+  // RPC method runs. `idFromName` + `.get()` skips that bookkeeping, which
+  // makes `this.name` throw inside the Agents SDK (workerd#2240) — and the
+  // SDK's `addMcpServer` reads `this.name` to build the OAuth state.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
+    addMcpServer: (name: string, url: string, opts: { callbackHost: string; callbackPath: string }) => Promise<{ state: string; authUrl?: string; id: string }>;
+    getMcpServers: () => Promise<{ servers: Record<string, { server_url?: string; state?: string }> }>;
+    removeMcpServer: (id: string) => Promise<void>;
+  };
+
+  const displayName = parsedUrl.host;
+
+  try {
+    // If a previous OAuth attempt for this MCP URL is still in storage,
+    // remove it before starting a new dance. Otherwise the SDK reuses the
+    // stale DCR registration (including the redirect_uri it was created
+    // with), which fails if we've since changed the callback path. The
+    // mismatch surfaces as "Redirect URI not allowed by application
+    // configuration" from the OAuth provider.
+    try {
+      const { servers } = await stub.getMcpServers();
+      for (const [sid, s] of Object.entries(servers)) {
+        if (s.server_url === mcpUrl) {
+          log("info", "start-auth: removing stale MCP server before re-auth", { userEmail, mcpUrl, mcpId: sid, prevState: s.state });
+          await stub.removeMcpServer(sid);
+        }
+      }
+    } catch (cleanupErr) {
+      // Cleanup failures shouldn't block a fresh DCR — the SDK will return
+      // a friendly error if the dance can't proceed.
+      log("warn", "start-auth: pre-auth cleanup failed", { userEmail, mcpUrl, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
+    }
+
+    // Derive the callback host from the live request URL, falling back to
+    // the env override if the worker is behind a known internal hostname.
+    // The previous hard-coded WORKER_URL ("http://localhost:8787") would
+    // silently break OAuth on every fresh deploy that didn't override it.
+    // (audit finding M12)
+    const reqUrl = new URL(c.req.raw.url);
+    const inferredHost = `${reqUrl.protocol}//${reqUrl.host}`;
+    const callbackHost = c.env.WORKER_URL && c.env.WORKER_URL !== "http://localhost:8787"
+      ? c.env.WORKER_URL
+      : inferredHost;
+    // callbackPath follows the Agents-SDK convention used by Seal et al:
+    // `/agents/<kebab-class-name>/<instance-name>/callback`. The trailing
+    // /callback segment matters — some OAuth providers reject redirect
+    // URIs that don't end in a recognised OAuth-callback suffix.
+    //
+    // Use the user's UserControl DO ID hex (not the email) as the
+    // instance segment. The `@` and `.` in an email — even though they
+    // are valid URL path characters per RFC 3986 — get URL-encoded by
+    // the OAuth client (`@` → `%40`) when included in the authorize
+    // request's redirect_uri query param. cf-portal's authorize endpoint
+    // appears to do a strict string comparison against the as-registered
+    // URI, so the encoded vs decoded forms don't match and the request
+    // is rejected with "Redirect URI not allowed by application
+    // configuration". Using a hex-only segment side-steps the encoding
+    // mismatch entirely.
+    const userId = c.env.USER_CONTROL.idFromName(userEmail).toString();
+    const callbackPath = `/agents/coding-agent/${userId}/callback`;
+    const result = await stub.addMcpServer(displayName, mcpUrl, {
+      callbackHost,
+      callbackPath,
+    });
+    if (result.state === "authenticating") {
+      return c.json({ authUrl: result.authUrl });
+    }
+    return c.json({ message: "Connected" });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "start-auth failed", { userEmail, mcpUrl, error: msg });
+    return c.json({ error: `Failed to start OAuth flow: ${msg}` }, 502);
+  }
+});
+
+// Delete an MCP OAuth connection
+app.post("/api/mcp/delete-auth", async (c) => {
+  let body: { mcpId?: string };
+  try {
+    body = await c.req.json<{ mcpId: string }>();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const mcpId = body.mcpId;
+  if (!mcpId || typeof mcpId !== "string") {
+    return c.json({ error: "mcpId required" }, 400);
+  }
+
+  const userEmail = c.get("userEmail");
+  // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
+    getMcpServers: () => { servers: Record<string, unknown> };
+    removeMcpServer: (id: string) => Promise<void>;
+  };
+
+  // Belt-and-braces: only allow deleting MCPs that actually live in this
+  // user's DO. Prevents cross-user deletion if callers ever share DO keys.
+  const servers = await stub.getMcpServers();
+  if (!servers.servers[mcpId]) {
+    return c.json({ error: "MCP not found" }, 404);
+  }
+
+  try {
+    await stub.removeMcpServer(mcpId);
+    return c.json({ ok: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "delete-auth failed", { userEmail, mcpId, error: msg });
+    return c.json({ error: `Failed to remove MCP: ${msg}` }, 500);
+  }
+});
+
+// Refresh an MCP connection (remove + re-add)
+app.post("/api/mcp/refresh-state", async (c) => {
+  let body: { mcpId?: string };
+  try {
+    body = await c.req.json<{ mcpId: string }>();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const mcpId = body.mcpId;
+  if (!mcpId || typeof mcpId !== "string") {
+    return c.json({ error: "mcpId required" }, 400);
+  }
+
+  const userEmail = c.get("userEmail");
+  // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
+    getMcpServers: () => { servers: Record<string, unknown> };
+    refreshMcpState: (id: string) => Promise<void>;
+  };
+
+  const servers = await stub.getMcpServers();
+  if (!servers.servers[mcpId]) {
+    return c.json({ error: "MCP not found" }, 404);
+  }
+
+  try {
+    await stub.refreshMcpState(mcpId);
+    return c.json({ ok: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "refresh-state failed", { userEmail, mcpId, error: msg });
+    return c.json({ error: `Failed to refresh MCP: ${msg}` }, 500);
+  }
+});
+
+// List the user's connected OAuth MCP servers (Agents-SDK-managed). The
+// hub DO is keyed by the user's email; per-session DOs federate tools via
+// `loadOAuthToolsFromHub`, so a single list per user is the authoritative
+// source of truth across all of their sessions.
+app.get("/api/mcp/oauth-servers", async (c) => {
+  const userEmail = c.get("userEmail");
+  // See /api/mcp/start-auth above for why getAgentByName instead of idFromName.
+  const stub = (await getAgentByName(c.env.CODING_AGENT as never, userEmail)) as unknown as {
+    getMcpServers: () => Promise<{
+      servers: Record<string, {
+        name?: string;
+        server_url?: string;
+        state?: string;
+        auth_url?: string | null;
+        error?: string | null;
+      }>;
+      tools: Array<{ serverId: string }>;
+    }>;
+  };
+  try {
+    const { servers, tools } = await stub.getMcpServers();
+    // Count tools per server so the UI can show "12 tools" next to each
+    // connected MCP server.
+    const toolCountByServer = new Map<string, number>();
+    for (const t of tools) {
+      toolCountByServer.set(t.serverId, (toolCountByServer.get(t.serverId) ?? 0) + 1);
+    }
+    const list = Object.entries(servers).map(([sid, s]) => ({
+      id: sid,
+      name: s.name ?? "",
+      url: s.server_url ?? "",
+      state: s.state ?? "unknown",
+      authUrl: s.auth_url ?? null,
+      error: s.error ?? null,
+      toolCount: toolCountByServer.get(sid) ?? 0,
+    }));
+    return c.json({ servers: list });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "/api/mcp/oauth-servers failed", { userEmail, error: msg });
+    return c.json({ error: `Failed to list MCP servers: ${msg}` }, 500);
+  }
+});
+
+// ─── MCP Catalog ───
+
+app.get("/api/mcp-catalog", async (c) => {
+  const email = c.get("userEmail");
+  const res = await proxyToUserControl(c.env, email, "/approved-mcps", { method: "GET" });
+  const entries = await res.json() as Array<{ status: string; mcp_url: string; id: string; display_name: string; description: string | null; setup_guide: string | null; known_hosts: string[]; auth_type: string }>;
+  const catalog = entries
+    .filter((e) => e.status === "enabled")
+    .map((e) => ({
+      id: e.id,
+      name: e.display_name,
+      description: e.description ?? "",
+      url: e.mcp_url,
+      setupGuide: e.setup_guide ?? "",
+      knownHosts: e.known_hosts,
+      auth_type: e.auth_type as "oauth" | "static_headers",
+    }));
+  return c.json(catalog);
+});
+
+// ─── Browser Rendering Config ───
+
+app.get("/api/browser-config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/browser-config");
+});
+
+app.put("/api/browser-config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/browser-config", {
+    method: "PUT",
+    body: await c.req.text(),
+    headers: { "content-type": "application/json" },
+  });
+});
+
+app.delete("/api/browser-config", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/browser-config", { method: "DELETE" });
+});
+
+// ─── Passkey / Onboarding ───
+
+app.get("/api/passkey/status", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/status");
+});
+
+app.post("/api/passkey/init", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/init", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.post("/api/passkey/change", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/change", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.post("/api/passkey/rotate-server-key", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/passkey/rotate-server-key", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+// ─── Onboarding ───
+
+app.get("/api/onboarding", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding");
+});
+
+app.post("/api/onboarding/advance", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding/advance", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.post("/api/onboarding/reset", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding/reset", { method: "POST" });
+});
+
+app.get("/api/onboarding/status", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/onboarding/status");
+});
+
+// ─── Identity ───
+
+app.get("/api/identity", async (c) => {
+  const email = c.get("userEmail");
+  return c.json({ email, isAdmin: isAdmin(email, c.env) });
+});
+
+// ─── User-level SSE (per-user via UserControl) ───
+
+app.get("/api/events", async (c) => {
+  const email = c.get("userEmail");
+  const stub = getUserControlStub(c.env, email);
+  const headers = new Headers();
+  headers.set("x-owner-email", email);
+  return stub.fetch("https://user-control/events", { headers });
+});
+
+// ─── Scheduled sessions (per-user via UserControl alarms) ───
+
+app.get("/api/scheduled-sessions", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/scheduled-sessions");
+});
+
+app.post("/api/scheduled-sessions", async (c) => {
+  const email = c.get("userEmail");
+  const rawBody = await c.req.raw.text();
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  // Fork-source permission check at CREATE time — matches the posture of
+  // /session/:id/cron (source is owned or shared at schedule time). If the
+  // source is later unshared/deleted, the fire will fail and the schedule
+  // will eventually stall.
+  if (parsed.source === "fork") {
+    const sourceSessionId = typeof parsed.sourceSessionId === "string" ? parsed.sourceSessionId : "";
+    if (!sourceSessionId) {
+      return c.json({ error: "fork source requires sourceSessionId" }, 400);
+    }
+    const perm = await resolveSessionPermission(c.env, email, sourceSessionId, c.req.raw);
+    if (!perm) {
+      return c.json({ error: "Source session not found or access denied" }, 403);
+    }
+    if ((PERMISSION_LEVELS[perm.permission] ?? -1) < (PERMISSION_LEVELS.write ?? 999)) {
+      return c.json({ error: "Insufficient permission on source session" }, 403);
+    }
+  }
+
+  // Inject createdBy so the DO can record the caller without trusting an
+  // untrusted body field.
+  const payload = { ...parsed, createdBy: email };
+
+  return proxyToUserControl(c.env, email, "/scheduled-sessions", {
+    body: JSON.stringify(payload),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.get("/api/scheduled-sessions/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/scheduled-sessions/${encodeURIComponent(c.req.param("id"))}`);
+});
+
+app.delete("/api/scheduled-sessions/:id", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/scheduled-sessions/${encodeURIComponent(c.req.param("id"))}`, {
+    method: "DELETE",
+  });
+});
+
+app.post("/api/scheduled-sessions/:id/retry", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, `/scheduled-sessions/${encodeURIComponent(c.req.param("id"))}/retry`, {
+    method: "POST",
+  });
+});
+
+// ─── Sessions (per-user via UserControl) ───
+
+app.post("/session", async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.json().catch(() => ({})) as {
+    ownerOverride?: string;
+    // Optional pre-session picker selections. Each entry sets the effective
+    // enabled flag for one skill / MCP in the new session. Absence means
+    // the picker wasn't used — caller wants the default behaviour.
+    skillOverrides?: Array<{ skillName: string; enabled: boolean }>;
+    mcpOverrides?: Array<{ mcpConfigId: string; enabled: boolean }>;
+  };
+  const sessionId = crypto.randomUUID();
+
+  // Check for account-level create permission (delegation)
+  let ownerEmail = email;
+  let createdBy = email;
+  let autoGrantWrite = false;
+
+  if (body.ownerOverride && body.ownerOverride !== email) {
+    // Explicit override: verify the user has create permission for that account
+    const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+    const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+    if (!checkBody.hasCreate || checkBody.accountOwner !== body.ownerOverride) {
+      return c.json({ error: "No create permission for the specified account" }, 403);
+    }
+    ownerEmail = body.ownerOverride;
+    createdBy = email;
+    autoGrantWrite = true;
+  } else if (!body.ownerOverride) {
+    // No explicit override: check if user has create permission (default to that account)
+    const checkRes = await proxyToSharedIndex(c.env, `/account-permissions/check?grantee=${encodeURIComponent(email)}`);
+    const checkBody = (await checkRes.json()) as { hasCreate: boolean; accountOwner: string | null };
+    if (checkBody.hasCreate && checkBody.accountOwner) {
+      ownerEmail = checkBody.accountOwner;
+      createdBy = email;
+      autoGrantWrite = true;
+    }
+  }
+
+  await proxyToUserControl(c.env, ownerEmail, "/sessions", {
+    body: JSON.stringify({ id: sessionId, ownerEmail, createdBy }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+
+  // Auto-grant readwrite permission to creator when creating in another's namespace
+  if (autoGrantWrite && ownerEmail !== email) {
+    await proxyToSharedIndex(c.env, "/permissions", {
+      body: JSON.stringify({
+        sessionId,
+        ownerEmail,
+        granteeEmail: email,
+        permission: "readwrite",
+        grantedBy: "system",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+  }
+
+  // Resolve which overrides to apply. The picker passes them explicitly;
+  // bare "+ New" sends an empty body, in which case we replay the user's
+  // last-session selection (the "Remember last session's selection"
+  // default behaviour). Explicit empty arrays in the body are honoured —
+  // that lets the picker say "all on" by sending an empty array, distinct
+  // from "use my last selection".
+  let appliedSkillOverrides = body.skillOverrides;
+  let appliedMcpOverrides = body.mcpOverrides;
+  if (appliedSkillOverrides === undefined && appliedMcpOverrides === undefined) {
+    try {
+      const prefsRes = await proxyToUserControl(c.env, ownerEmail, "/session-preferences");
+      if (prefsRes.ok) {
+        const prefs = (await prefsRes.json()) as {
+          skillOverrides: Array<{ skillName: string; enabled: boolean }>;
+          mcpOverrides: Array<{ mcpConfigId: string; enabled: boolean }>;
+        };
+        appliedSkillOverrides = prefs.skillOverrides;
+        appliedMcpOverrides = prefs.mcpOverrides;
+      }
+    } catch (e) {
+      log("warn", "Failed to load session preferences for default-apply", { email, sessionId, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  // Apply pre-session picker selections (if any) before the agent first
+  // wakes up. Use bulk PUT endpoints so the whole selection lands in one
+  // round-trip each.
+  if (appliedSkillOverrides && appliedSkillOverrides.length > 0) {
+    await proxyToUserControl(c.env, ownerEmail, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`, {
+      body: JSON.stringify({ overrides: appliedSkillOverrides }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+  if (appliedMcpOverrides && appliedMcpOverrides.length > 0) {
+    await proxyToUserControl(c.env, ownerEmail, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides`, {
+      body: JSON.stringify({ overrides: appliedMcpOverrides }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+  // Remember the explicit picker selection (only when the caller provided
+  // one — replays from last-session don't need re-saving).
+  if (body.skillOverrides !== undefined || body.mcpOverrides !== undefined) {
+    await proxyToUserControl(c.env, ownerEmail, "/session-preferences", {
+      body: JSON.stringify({
+        skillOverrides: body.skillOverrides ?? [],
+        mcpOverrides: body.mcpOverrides ?? [],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+  }
+
+  log("info", "Session created", {
+    email,
+    sessionId,
+    ownerEmail,
+    createdBy,
+    skillOverrides: appliedSkillOverrides?.length ?? 0,
+    mcpOverrides: appliedMcpOverrides?.length ?? 0,
+    pickerProvided: body.skillOverrides !== undefined || body.mcpOverrides !== undefined,
+  });
+  // Increment global session counter
+  await proxyToSharedIndex(c.env, "/stats/increment", {
+    body: JSON.stringify({ stat: "sessionCount", delta: 1 }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  return c.json({ id: sessionId, ownerEmail, createdBy }, 201);
+});
+
+app.get("/session", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/sessions");
+});
+
+// ─── Session ownership + permission middleware ───
+
+app.use("/session/:id/*", async (c, next) => {
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const result = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
+  if (!result) {
+    return c.json({ error: "Session not found or access denied" }, 403);
+  }
+  c.set("sessionPermission", result.permission);
+  c.set("sessionOwnerEmail", result.ownerEmail);
+  return next();
+});
+
+app.use("/session/:id", async (c, next) => {
+  // Skip ownership check for POST (handled by the create route above)
+  if (c.req.method === "POST") return next();
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const result = await resolveSessionPermission(c.env, email, sessionId, c.req.raw);
+  if (!result) {
+    return c.json({ error: "Session not found or access denied" }, 403);
+  }
+  c.set("sessionPermission", result.permission);
+  c.set("sessionOwnerEmail", result.ownerEmail);
+  return next();
+});
+
+app.get("/session/:id", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const ownerEmail = c.get("sessionOwnerEmail") || c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/", { "x-owner-email": ownerEmail });
+});
+
+app.patch("/session/:id", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const body = await c.req.raw.text();
+  return proxyToUserControl(c.env, email, `/sessions/${sessionId}`, {
+    body,
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+});
+
+app.delete("/session/:id", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const result = await proxyToAgent(c.req.raw, c.env, sessionId, "/", { "x-owner-email": email });
+  await proxyToUserControl(c.env, email, `/sessions/${sessionId}`, { method: "DELETE" });
+  // Cascade: clean up shares and permissions for this session
+  await proxyToSharedIndex(c.env, `/sessions/${encodeURIComponent(sessionId)}/cleanup`, { method: "DELETE" });
+  return result;
+});
+
+app.get("/session/:id/debug/compaction", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/debug/compaction");
+});
+
+// Per-config MCP connect status from the most recent connectMcpServers() run.
+// Lets the UI explain why an MCP config has no tools (e.g. "Invalid Bearer
+// token format") instead of silently dropping them.
+app.get("/session/:id/mcp-status", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const ownerEmail = c.get("sessionOwnerEmail") || c.get("userEmail");
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/mcp-status", { "x-owner-email": ownerEmail });
+});
+
+
+
+// ─── Facet transcripts (Phase 5) ───
+//
+// Read-only surface for inspecting ExploreAgent / TaskAgent runs on a
+// session. `GET /facets` lists recent runs; `/facets/:name/transcript`
+// returns the full message log from the named facet. No write paths —
+// facet transcripts are immutable by construction.
+
+app.get("/session/:id/facets", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/facets${new URL(c.req.raw.url).search}`);
+});
+
+app.get("/session/:id/facets/:facetName/transcript", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(
+    c.req.raw,
+    c.env,
+    c.req.param("id"),
+    `/facets/${encodeURIComponent(c.req.param("facetName"))}/transcript`,
+  );
+});
+
+// Merge scratch-mode task facet writes back into the main workspace.
+// Body: { paths: string[] }. Requires write permission — this mutates
+// the parent workspace. The facet validates each path against its own
+// scratch-writes index and returns { applied, skipped } so the caller
+// can see which files made it through.
+app.post("/session/:id/facets/:facetName/apply", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(
+    c.req.raw,
+    c.env,
+    c.req.param("id"),
+    `/facets/${encodeURIComponent(c.req.param("facetName"))}/apply`,
+  );
+});
+
+app.get("/session/:id/messages", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/messages");
+});
+
+app.get("/session/:id/prompts", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompts");
+});
+
+app.get("/session/:id/todos", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/todos");
+});
+
+app.get("/session/:id/prompt-queue", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt-queue");
+});
+
+app.delete("/session/:id/prompt-queue/:queueId", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/prompt-queue/${encodeURIComponent(c.req.param("queueId"))}`, {
+    method: "DELETE",
+  });
+});
+
+app.get("/session/:id/cron", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron");
+});
+
+app.get("/session/:id/watchdog", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/watchdog");
+});
+
+app.get("/session/:id/events", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/events");
+});
+
+app.get("/session/:id/files", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/files${new URL(c.req.raw.url).search}`);
+});
+
+app.get("/session/:id/artifacts", async (c) => {
+  // Returns the per-session Artifacts repo metadata + a short-lived
+  // authenticated clone URL. Readonly because the caller is just
+  // viewing/cloning their own session repo. Same scope gate as the
+  // existing get_artifacts_remote MCP tool.
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/artifacts");
+});
+
+app.get("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
+
+app.put("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
+
+app.patch("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
+
+app.delete("/session/:id/file", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/file${new URL(c.req.raw.url).search}`);
+});
+
+// Serve an image attachment (chat screenshot, user upload, generated image).
+// Hono wildcard captures {messageId}/{filename} as the second path segment.
+// ACL is inherited from the /session/:id/* middleware — if the caller can't
+// read the session, they can't read its attachments.
+app.get("/session/:id/attachment/:messageId/:filename", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const messageId = c.req.param("messageId");
+  const filename = c.req.param("filename");
+  if (!sessionId || !messageId || !filename) {
+    return c.json({ error: "Missing path segment" }, 400);
+  }
+  const response = await fetchAttachment(c.env, sessionId, `${messageId}/${filename}`);
+  if (!response) return c.json({ error: "Attachment not found" }, 404);
+  return response;
+});
+
+app.post("/session/:id/search", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/search");
+});
+
+app.post("/session/:id/execute", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/execute");
+});
+
+app.post("/session/:id/git/init", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/init");
+});
+app.post("/session/:id/git/clone", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/clone", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/add", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/add");
+});
+app.post("/session/:id/git/commit", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/commit", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/branch", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/branch");
+});
+app.post("/session/:id/git/checkout", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/checkout");
+});
+app.post("/session/:id/git/pull", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/pull", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/push", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/push", { "x-owner-email": c.get("userEmail") });
+});
+app.post("/session/:id/git/remote", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/git/remote");
+});
+app.get("/session/:id/git/status", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/status${new URL(c.req.raw.url).search}`);
+});
+app.get("/session/:id/git/log", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/log${new URL(c.req.raw.url).search}`);
+});
+app.get("/session/:id/git/diff", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/git/diff${new URL(c.req.raw.url).search}`);
+});
+
+app.post("/session/:id/message", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const rl = messageLimiter.check(`msg:${email}`, 120, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "message", email);
+  // Use the session owner's config for model/gateway so guests don't override it
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  const config = await readConfig(c.env, ownerEmail);
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/message", {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    "x-author-email": email,
+    "x-owner-email": ownerEmail,
+  });
+});
+
+app.post("/session/:id/prompt", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const rl = promptLimiter.check(`prompt:${email}`, 60, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "prompt", email);
+  // Use the session owner's config for model/gateway so guests don't override it
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  const config = await readConfig(c.env, ownerEmail);
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/prompt", {
+    "x-dodo-ai-base-url": config.aiGatewayBaseURL,
+    "x-dodo-gateway": config.activeGateway,
+    "x-dodo-model": config.model,
+    "x-dodo-opencode-base-url": config.opencodeBaseURL,
+    "x-author-email": email,
+    "x-owner-email": ownerEmail,
+  });
+});
+
+app.post("/session/:id/generate", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  // Hourly cap bounds burst traffic, daily cap bounds long-horizon cost
+  // exposure — FLUX is pay-per-call so we want both ceilings.
+  const hourly = promptLimiter.check(`generate-hr:${email}`, 30, 60 * 60 * 1000);
+  if (!hourly.allowed) return rateLimitedResponse(hourly, "generate", email);
+  const daily = promptLimiter.check(`generate-day:${email}`, 100, 24 * 60 * 60 * 1000);
+  if (!daily.allowed) return rateLimitedResponse(daily, "generate", email);
+  const ownerEmail = c.get("sessionOwnerEmail") || email;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/generate", {
+    "x-author-email": email,
+    "x-owner-email": ownerEmail,
+  });
+});
+
+app.get("/session/:id/ws", async (c) => {
+  const upgradeHeader = c.req.header("Upgrade");
+  if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+    return c.json({ error: "Expected WebSocket upgrade" }, 426);
+  }
+
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const permission = c.get("sessionPermission") ?? "readonly";
+  const agent = await getAgentByName(c.env.CODING_AGENT as never, sessionId);
+
+  // Forward WebSocket upgrade to the CodingAgent DO
+  const url = new URL(c.req.url);
+  const wsUrl = new URL("https://coding-agent/ws");
+  wsUrl.searchParams.set("email", email);
+  wsUrl.searchParams.set("displayName", email);
+  wsUrl.searchParams.set("permission", permission);
+  // Preserve any extra query params from the original request
+  for (const [key, value] of url.searchParams) {
+    if (!wsUrl.searchParams.has(key)) {
+      wsUrl.searchParams.set(key, value);
+    }
+  }
+
+  return agent.fetch(new Request(wsUrl.toString(), {
+    headers: c.req.raw.headers,
+  }));
+});
+
+app.post("/session/:id/abort", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/abort");
+});
+
+app.get("/session/:id/browser", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
+});
+
+app.put("/session/:id/browser", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  // Non-admin users must have browser_enabled set by admin before they can toggle browser on sessions.
+  const email = c.get("userEmail");
+  if (!isAdmin(email, c.env)) {
+    const allowed = await checkBrowserEnabled(email, c.env);
+    if (!allowed) {
+      return c.json({ error: "Browser access not enabled for your account. Ask your admin to enable it." }, 403);
+    }
+  }
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/browser");
+});
+
+app.post("/session/:id/cron", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/cron");
+});
+
+app.delete("/session/:id/cron/:cronId", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), `/cron/${encodeURIComponent(c.req.param("cronId"))}`);
+});
+
+app.put("/session/:id/watchdog", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/watchdog");
+});
+
+app.delete("/session/:id/watchdog", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/watchdog");
+});
+
+app.post("/session/:id/fork", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sourceId = c.req.param("id");
+  // Pass the resolved source owner so forkSessionInternal can hit the
+  // source's UserControl DO instead of the caller's. Without this, users
+  // with a granted readwrite share could not fork a session they don't
+  // personally own. (audit finding M5)
+  const sourceOwner = c.get("sessionOwnerEmail") || email;
+  try {
+    const { id, sourceId: resolvedSourceId } = await forkSessionInternal(c.env, email, sourceId, null, sourceOwner);
+    return c.json({ id, sourceId: resolvedSourceId }, 201);
+  } catch (error) {
+    if (error instanceof SourceSessionMissingError) {
+      return c.json({ error: error.message, sourceId }, 404);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message, sourceId }, 500);
+  }
+});
+
+// ─── Share link management (session owner only) ───
+
+app.post("/session/:id/share", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const rl = shareLimiter.check(`share:${sessionId}`, 20, 60 * 60 * 1000);
+  if (!rl.allowed) return rateLimitedResponse(rl, "share", email);
+  const body = await c.req.raw.json() as Record<string, unknown>;
+  const result = await proxyToSharedIndex(c.env, "/shares", {
+    body: JSON.stringify({
+      sessionId,
+      ownerEmail: email,
+      permission: body.permission ?? "readonly",
+      label: body.label,
+      expiresAt: body.expiresAt,
+      createdBy: email,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  log("info", "Share created", { email, sessionId, permission: body.permission ?? "readonly" });
+  return result;
+});
+
+app.get("/session/:id/shares", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  return proxyToSharedIndex(c.env, `/shares?sessionId=${encodeURIComponent(sessionId)}`);
+});
+
+app.delete("/session/:id/share/:shareId", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const shareId = c.req.param("shareId");
+  const email = c.get("userEmail");
+  log("info", "Share revoked", { email, sessionId: c.req.param("id"), shareId });
+  return proxyToSharedIndex(c.env, `/shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
+});
+
+// ─── Permission management (session owner only) ───
+
+app.get("/session/:id/permissions", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  return proxyToSharedIndex(c.env, `/permissions?sessionId=${encodeURIComponent(sessionId)}`);
+});
+
+app.post("/session/:id/permissions", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const email = c.get("userEmail");
+  const body = await c.req.raw.json() as Record<string, unknown>;
+  return proxyToSharedIndex(c.env, "/permissions", {
+    body: JSON.stringify({
+      sessionId,
+      ownerEmail: email,
+      granteeEmail: body.granteeEmail,
+      permission: body.permission ?? "readonly",
+      grantedBy: email,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/permissions/:email", async (c) => {
+  const denied = requirePermission(c, "admin");
+  if (denied) return denied;
+  const sessionId = c.req.param("id");
+  const granteeEmail = c.req.param("email");
+  return proxyToSharedIndex(c.env, `/permissions/${encodeURIComponent(sessionId)}/${encodeURIComponent(granteeEmail)}`, { method: "DELETE" });
+});
+
+// ─── Session MCP Config Overrides ───
+
+app.get("/session/:id/mcp-configs", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/effective-mcp-configs`);
+});
+
+app.post("/session/:id/mcp-configs", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/mcp-configs/:mcpId", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const mcpId = c.req.param("mcpId");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/mcp-overrides/${encodeURIComponent(mcpId)}`, {
+    method: "DELETE",
+  });
+});
+
+// ─── Session Skill Overrides ───
+//
+// Mirror of MCP override routes for skills. The picker writes these at
+// session-creation time; the in-session settings UI can also toggle
+// individual skills after creation.
+
+app.get("/session/:id/skill-overrides", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`);
+});
+
+app.post("/session/:id/skill-overrides", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides`, {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/session/:id/skill-overrides/:skillName", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  const email = c.get("userEmail");
+  const sessionId = c.req.param("id");
+  const skillName = c.req.param("skillName");
+  return proxyToUserControl(c.env, email, `/sessions/${encodeURIComponent(sessionId)}/skill-overrides/${encodeURIComponent(skillName)}`, {
+    method: "DELETE",
+  });
+});
+
+// ─── Session goals (powers self-continuation) ───
+//
+// A session with a goal auto-continues each turn until the model calls
+// `set_goal_status` (done | blocked | needs_input) or the turn budget runs
+// out. Setting a goal here is what makes any session goal-directed —
+// autopilot, supervisor, or just a user who wants a long task to keep
+// running without manual nudges.
+
+app.get("/session/:id/goal", async (c) => {
+  const denied = requirePermission(c, "readonly");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/goal", undefined, c.get("sessionOwnerEmail") || c.get("userEmail"));
+});
+
+app.put("/session/:id/goal", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/goal", undefined, c.get("sessionOwnerEmail") || c.get("userEmail"));
+});
+
+app.delete("/session/:id/goal", async (c) => {
+  const denied = requirePermission(c, "write");
+  if (denied) return denied;
+  return proxyToAgent(c.req.raw, c.env, c.req.param("id"), "/goal", undefined, c.get("sessionOwnerEmail") || c.get("userEmail"));
+});
+
+// ─── Last-session preference memory (powers the pre-session picker) ───
+
+app.get("/api/session-preferences", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/session-preferences");
+});
+
+app.put("/api/session-preferences", async (c) => {
+  const email = c.get("userEmail");
+  return proxyToUserControl(c.env, email, "/session-preferences", {
+    body: await c.req.raw.text(),
+    headers: { "content-type": "application/json" },
+    method: "PUT",
+  });
+});
+
+// ─── Admin: account-level permissions ───
+
+app.post("/api/admin/account-permissions", adminGuard as never, async (c) => {
+  const email = c.get("userEmail");
+  const body = await c.req.raw.json() as Record<string, unknown>;
+  return proxyToSharedIndex(c.env, "/account-permissions", {
+    body: JSON.stringify({
+      accountOwner: body.accountOwner,
+      granteeEmail: body.granteeEmail,
+      permission: body.permission,
+      grantedBy: email,
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+});
+
+app.delete("/api/admin/account-permissions/:owner/:email", adminGuard as never, async (c) => {
+  const owner = c.req.param("owner");
+  const granteeEmail = c.req.param("email");
+  return proxyToSharedIndex(c.env, `/account-permissions/${encodeURIComponent(owner)}/${encodeURIComponent(granteeEmail)}`, { method: "DELETE" });
+});
+
+app.get("/api/admin/account-permissions", adminGuard as never, async (c) => {
+  const owner = new URL(c.req.raw.url).searchParams.get("owner") ?? "";
+  return proxyToSharedIndex(c.env, `/account-permissions?owner=${encodeURIComponent(owner)}`);
+});
+
+export { AllowlistOutbound, ChatMonitorAgent, CodingAgent, ExploreAgent, SharedIndex, TaskAgent, UserControl };
+
+export default {
+  fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
+    return Promise.resolve(app.fetch(request, env, executionContext));
+  },
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    await runHealthCheck(env, ctx);
+  },
+};

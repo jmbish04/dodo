@@ -1,0 +1,74 @@
+{
+  /**
+   * Local development config — extends wrangler.jsonc but collapses migrations
+   * to avoid the "Cannot apply deleted_classes to non-existent class" error.
+   *
+   * Usage: wrangler dev -c wrangler.dev.jsonc
+   *
+   * IMPORTANT: Keep everything in sync with wrangler.jsonc except migrations.
+   * If you add a new DO class or binding in wrangler.jsonc, add it here too.
+   */
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dodo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+  // Mirror wrangler.jsonc — required for shell tool's busybox.wasm imports.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": false }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CODING_AGENT", "class_name": "CodingAgent" },
+      { "name": "USER_CONTROL", "class_name": "UserControl" },
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" }
+    ]
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [
+    {
+      "binding": "OUTBOUND",
+      "service": "dodo",
+      "entrypoint": "AllowlistOutbound"
+    }
+  ],
+  // Collapsed migration — fresh local dev doesn't need the historical chain.
+  // Production uses wrangler.jsonc which has the full v1→v2→v3 history.
+  "migrations": [
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["CodingAgent", "UserControl", "SharedIndex"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
+  "assets": {
+    "directory": "./public"
+  },
+  "vars": {
+    // Set these to your Cloudflare Access application's audience tag and team domain.
+    "CF_ACCESS_AUD": "your-cf-access-audience-tag",
+    "CF_ACCESS_TEAM_DOMAIN": "https://your-team.cloudflareaccess.com",
+    // Set this to any model your LLM gateway supports
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
+    // Default model used when a new session is created with activeGateway=ai-gateway.
+    "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
+    // AI Gateway unified API: include /{account_id}/{gateway_id}/compat
+    "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/your-account-id/your-gateway/compat",
+    "DODO_VERSION": "0.4.0-dev",
+    "ADMIN_EMAIL": "you@example.com"
+  }
+}

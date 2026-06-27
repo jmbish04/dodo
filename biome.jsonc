@@ -1,0 +1,73 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  // External lint gate — runs in CI alongside typecheck and tests. Cannot
+  // run inside a Dodo session DO (Biome's wasm bundle is ~8 MB gzipped,
+  // wouldn't fit alongside the existing ~1.5 MB typescript bundle within
+  // Workers' 10 MB compressed script limit). For in-isolate feedback the
+  // model uses the `typecheck` tool with `extraStrict: true`, which covers
+  // ~30% of the same ground via TypeScript's own diagnostics.
+  //
+  // Scope: correctness + suspicious rules only. Formatting is intentionally
+  // disabled — the project hasn't adopted a formatter and that's a separate
+  // call. Style rules are off too: they generate too much noise on an
+  // existing codebase to be a useful CI gate without weeks of cleanup.
+  "files": {
+    "includes": [
+      "src/**/*.ts",
+      "src/**/*.tsx",
+      "test/**/*.ts",
+      "scripts/**/*.mjs",
+      "scripts/**/*.ts",
+      "!!**/src/typecheck-libs.generated.ts",
+      "!!**/src/runtime/busyworker/**",
+      "!!**/node_modules",
+      "!!**/dist",
+      "!!**/.wrangler",
+      "!!**/coverage",
+      "!!**/public"
+    ]
+  },
+  // `recommended: false` makes individual `error` entries the explicit
+  // allow-list. Anything not listed here is off — there is no point
+  // enumerating "off" entries against rules biome wouldn't run anyway.
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "correctness": {
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error",
+        "noUnusedPrivateClassMembers": "error",
+        "noConstAssign": "error",
+        "noConstantCondition": "error",
+        "noUnreachable": "error",
+        "noUnsafeFinally": "error",
+        "noVoidTypeReturn": "error"
+      },
+      "suspicious": {
+        "noDoubleEquals": "error",
+        "noDuplicateCase": "error",
+        "noDuplicateClassMembers": "error",
+        "noDuplicateObjectKeys": "error",
+        "noDuplicateParameters": "error",
+        "noFallthroughSwitchClause": "error",
+        "noMisleadingCharacterClass": "error",
+        "noMisleadingInstantiator": "error",
+        "noShadowRestrictedNames": "error",
+        "noSparseArray": "error",
+        "noUnsafeNegation": "error",
+        "useGetterReturn": "error",
+        "useIsArray": "error"
+      },
+      "complexity": {
+        "noUselessCatch": "error",
+        "noUselessContinue": "error",
+        "noUselessRename": "error",
+        "noUselessTypeConstraint": "error"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": false
+  }
+}

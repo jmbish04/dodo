@@ -1,0 +1,164 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dodo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+  // Allow `*.wasm` imports to resolve to `WebAssembly.Module` at deploy
+  // time. Required by `src/tools/shell.ts` which static-imports
+  // busybox.wasm + initramfs.wasm from vendor/wasm/busybox/. Wrangler
+  // forbids runtime `WebAssembly.compile`, so all our wasm modules must
+  // be imported this way.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": false }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CODING_AGENT", "class_name": "CodingAgent" },
+      { "name": "USER_CONTROL", "class_name": "UserControl" },
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" },
+      { "name": "CHAT_MONITOR", "class_name": "ChatMonitorAgent" }
+    ]
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [
+    {
+      "binding": "OUTBOUND",
+      "service": "dodo",
+      "entrypoint": "AllowlistOutbound"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CodingAgent"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["UserControl", "SharedIndex"]
+    },
+    {
+      "tag": "v3",
+      "deleted_classes": ["AppControl"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
+    },
+    {
+      // No-op tag — server already at v5. Future migrations should bump
+      // from v6 onward.
+      "tag": "v5"
+    },
+    {
+      // The deployed worker has an `OutboundProxy` Durable Object class
+      // registered (added by an out-of-band wrapper-Worker spike on the
+      // codemode globalOutbound problem). The class is no longer in the
+      // codebase, so we delete it here. Without this migration the
+      // deploy fails with code 10064 (missing class).
+      "tag": "v6",
+      "deleted_classes": ["OutboundProxy"]
+    },
+    {
+      // ChatMonitorAgent — PoC Google Chat monitor (DO with alarm loop).
+      // See src/chat-monitor-agent.ts.
+      "tag": "v7",
+      "new_sqlite_classes": ["ChatMonitorAgent"]
+    }
+  ],
+  "r2_buckets": [
+    // Chat attachments (screenshots, uploaded images, model-generated images)
+    // are stored in this bucket under the `attachments/` prefix. Run
+    // `scripts/setup-attachment-lifecycle.sh` once per account to provision
+    // the 30-day auto-expiry rule — lifecycle rules aren't yet configurable
+    // from wrangler.jsonc, so they live out-of-band.
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces","preview_bucket_name": "dodo-workspaces" },
+    // Fork snapshots — large opaque JSON blobs (often 5–10 MB once a
+    // cloned repo's git pack files are base64-encoded) used by
+    // forkSessionInternal to copy a workspace from one CodingAgent into
+    // another. Previously stored as a single SQLite TEXT row in the
+    // owner's UserControl DO, which trips SQLITE_TOOBIG above ~2 MB.
+    // R2 has no relevant size cap at this scale and the snapshot is
+    // already a one-shot intermediate (deleted after import), so a
+    // dedicated bucket is the simplest fix.
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots","preview_bucket_name": "dodo-fork-snapshots" }
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "default"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
+  "build": {
+    "command": "npm run build"
+  },
+  "assets": {
+    "directory": "./public",
+    // Required so `c.env.ASSETS.fetch(...)` works inside route handlers.
+    // Without the binding declaration, `env.ASSETS` is undefined and any
+    // page route that relies on the binding (e.g. /admin/seeds,
+    // /admin/autopilot, /admin/chat-monitors) falls through to its
+    // "Admin page not available" fallback.
+    "binding": "ASSETS"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "secrets": {
+    "required": ["ADMIN_EMAIL"]
+  },
+  "vars": {
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-4",
+    // Default model used when a new session is created with activeGateway=ai-gateway.
+    // Workers AI models (`@cf/…`) are only routable via AI Gateway.
+    "AI_GATEWAY_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.6",
+    // Default model for the `explore` / `task` subagents.
+    //
+    // Initially set to Kimi K2.6 based on the main-model comparison, but
+    // the 2026-04-24 demo verification runs showed Kimi as an EXPLORE
+    // model keeps grep/read-ing and never synthesizes a final summary on
+    // repos this size — it burned 176k tokens across 12 steps in demo
+    // 4ffee77a and returned empty output. Haiku 4.5 completes the same
+    // query in 1 call with ~2k output tokens (demo 03c51aff: 76k total
+    // parent tokens vs 132k for the Kimi run).
+    //
+    // Conclusion: Kimi is great as a main model for investigate-and-report,
+    // but explore's success criterion (short synthesized summary from tool
+    // traces) suits an instruction-follower better. Haiku is cheap
+    // ($0.80/M in, $4/M out), fast, and converges reliably.
+    //
+    // Overrides: PUT /config exploreModel=..., or pass model=... per call.
+    // Auto-routed via AI Gateway for @cf/* models — see
+    // buildProviderForModel in src/agentic.ts.
+    "DEFAULT_EXPLORE_MODEL": "anthropic/claude-haiku-4-5",
+    // Default `task` subagent model. Same choice for the same reason —
+    // task needs to edit files then summarize; Haiku does both well.
+    "DEFAULT_TASK_MODEL": "anthropic/claude-haiku-4-5",
+    "OPENCODE_BASE_URL": "https://opencode.cloudflare.dev/compat",
+    // AI Gateway unified API base URL — include /{account_id}/{gateway_id}/compat
+    // so the OpenAI-compatible SDK hits /chat/completions correctly.
+    "AI_GATEWAY_BASE_URL": "https://gateway.ai.cloudflare.com/v1/4b430e167a301330d13a9bb42f3986a2/jp-gw/compat",
+    "WORKER_URL": "http://localhost:8787",
+    "DODO_VERSION": "0.4.0",
+    // Worker script name used when querying Workers Observability for our
+    // own logs (admin self-diagnose). Paired with CLOUDFLARE_ACCOUNT_ID
+    // (var, below) and CLOUDFLARE_API_TOKEN (secret, set via
+    // `wrangler secret put`) — without all three the cloudflare-logs
+    // helpers return an empty result.
+    "DODO_WORKER_NAME": "dodo",
+    "CLOUDFLARE_ACCOUNT_ID": "4b430e167a301330d13a9bb42f3986a2"
+  }
+}

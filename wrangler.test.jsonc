@@ -1,0 +1,54 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dodo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+  // Mirror wrangler.jsonc — required for shell tool's busybox.wasm imports.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": false }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CODING_AGENT", "class_name": "CodingAgent" },
+      { "name": "USER_CONTROL", "class_name": "UserControl" },
+      { "name": "SHARED_INDEX", "class_name": "SharedIndex" }
+    ]
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [
+    {
+      "binding": "OUTBOUND",
+      "service": "dodo",
+      "entrypoint": "AllowlistOutbound"
+    }
+  ],
+  // Test environment only needs the class creation migrations.
+  // The v3 "deleted_classes" migration for AppControl is a production
+  // deployment concern — vitest-pool-workers chokes on deleting a class
+  // that was never declared in the test bindings.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CodingAgent"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["UserControl", "SharedIndex"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ExploreAgent", "TaskAgent"]
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "WORKSPACE_BUCKET", "bucket_name": "dodo-workspaces" },
+    { "binding": "FORK_SNAPSHOTS", "bucket_name": "dodo-fork-snapshots" }
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "assets": {
+    "directory": "./public"
+  }
+}

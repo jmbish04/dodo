@@ -1,0 +1,7314 @@
+import { DynamicWorkerExecutor, type ExecuteResult, resolveProvider } from "@cloudflare/codemode";
+import { createWorkspaceStateBackend, Workspace } from "@cloudflare/shell";
+import { stateTools } from "@cloudflare/shell/workers";
+import { type AgentNamespace, type Connection, type ConnectionContext, getAgentByName, type WSMessage } from "agents";
+import { type FileUIPart, generateText, type LanguageModel, type ModelMessage, streamText, type ToolSet } from "ai";
+import { z } from "zod";
+import { buildProvider, buildToolsForThink } from "./agentic";
+import { flushTurnToArtifacts, ARTIFACTS_TOKEN_TTL_SECONDS, type ArtifactsFsCache, buildArtifactsCloneUrl, listArtifactsTree, readArtifactsFile, refreshArtifactsFs } from "./artifacts";
+import type { ArtifactsRepo } from "./artifacts-types";
+import type { AttachmentRef } from "./attachments";
+import { rewriteAttachmentsForClient, sanitizeUserImage, uploadAttachment } from "./attachments";
+import { getUserControlStub, isAdmin } from "./auth";
+import { listBuiltinSkills } from "./builtin-skills";
+import { bytesToBase64Chunked } from "./crypto";
+import { ExploreAgent, type ExploreQueryOpts, type ExploreQueryResult } from "./explore-agent";
+import { createWorkspaceGit, defaultAuthor, resolveRemoteToken, verifyRemoteBranch } from "./git";
+import { log } from "./logger";
+import { HttpMcpClient, type McpClient, type McpClientConfig } from "./mcp-client";
+import { dispatchNotification } from "./notify";
+import { normalizePath } from "./paths";
+import { PresenceTracker } from "./presence";
+import { AgentConnectionTransport } from "./rpc";
+import { extractGeneratePrompt, FALLBACK_MODELS, FLUX_IMAGE_MEDIA_TYPE, FLUX_IMAGE_MODEL, FLUX_MAX_PROMPT_LENGTH, WORKERS_AI_MODELS } from "./model-catalog";
+import {
+  type GoalState,
+  type GoalStatus,
+  renderGoalSystemPromptSection,
+} from "./session-goal";
+import { createGoalStateStore, type GoalStateStore } from "./goal-state-store";
+import {
+  createSessionControlPlane,
+  type MetadataKv,
+  type SessionControlPlane,
+} from "./session-control-plane";
+import {
+  createSessionLifecycle,
+  type SessionLifecycle,
+} from "./session-lifecycle";
+import { createWatchdogState, type WatchdogState } from "./watchdog-state";
+import {
+  createPersonalSkillClient,
+  mergeSkills,
+  renderSkillContent,
+  renderManifest as renderSkillManifest,
+  type Skill,
+  scanWorkspaceSkills,
+} from "./skill-registry";
+import { epochToIso, nowEpoch, type SqlRow } from "./sql-helpers";
+import { TaskAgent, type TaskInvokeOpts, type TaskInvokeResult } from "./task-agent";
+import type { SnapshotV2 } from "./think-adapter";
+import {
+  type ChatMessageOptions,
+  chatRecordToUIMessage,
+  type DodoConfig,
+  type FiberCompleteContext,
+  type FiberRecoveryContext,
+  type MessageMetadata,
+  type StreamableResult,
+  type StreamCallback,
+  Think,
+
+  truncateToolOutput,
+  type UIMessage,
+  uiMessageToChatRecord,
+} from "./think-adapter";
+import type { AppConfig, ChatMessageRecord, CronJobRecord, Env, PromptRecord, SessionEvent, SessionSnapshot, SessionState, TodoItem, TodoPriority, TodoStatus, TodoStore, WorkspaceEntry } from "./types";
+import {
+  DEFAULT_NUDGE_PROMPT,
+  formatStallBody,
+  normaliseWatchdogConfig,
+  type WatchdogConfig,
+} from "./watchdog";
+import { shouldCompact, pickCutoff } from "./compaction-policy";
+import { shouldRunFinalSummary, stripHarnessNotices } from "./final-summary-policy";
+import { detectSameToolRepetition } from "./loop-detection";
+import { pruneOversizedToolResults } from "./own-loop-prune";
+import { nextRetry } from "./overflow-retry";
+import { assembleSystemPrompt } from "./prompt-composer";
+import { evaluateSession } from "./watchdog-policy";
+
+/**
+ * Context window sizes (in tokens) by model ID. Used for token budget enforcement.
+ *
+ * Derived from the shared model catalog in model-catalog.ts so the two lists
+ * cannot drift. If a model is missing from the catalog but used at runtime,
+ * DEFAULT_CONTEXT_WINDOW applies. See issue #34.
+ */
+const CONTEXT_WINDOW_TOKENS: Record<string, number> = Object.fromEntries(
+  [...FALLBACK_MODELS, ...WORKERS_AI_MODELS].map((m) => [m.id, m.contextWindow]),
+);
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+/** Budget factor — use 80% of context window for messages, leave 20% for response. */
+const CONTEXT_BUDGET_FACTOR = 0.8;
+
+/**
+ * Compaction settings.
+ * When context usage exceeds COMPACTION_TRIGGER_PERCENT of the budget, older
+ * messages are summarized by an LLM call and stored as a compaction record.
+ * Think's assembleContext() automatically injects the summary in place of
+ * the original messages on subsequent turns.
+ */
+const COMPACTION_TRIGGER_PERCENT = 60;
+/** Fraction of messages to compact (from the oldest end). */
+const COMPACTION_MESSAGE_FRACTION = 0.5;
+/** Model to use for generating compaction summaries — cheap and fast. */
+// Use Haiku 4.5 for compaction — fast, cheap ($1/M input, 3x cheaper than Sonnet),
+// and good at structured summarization. Falls back to session model if unavailable.
+const COMPACTION_MODEL = "anthropic/claude-haiku-4-5";
+
+/** Zero-cost marker that replaces cleared tool output — ~8 tokens. */
+const CLEARED_MARKER = "[Old tool result content cleared]";
+
+/**
+ * Content-aware tokens-per-char ratios derived from Anthropic tokenizer
+ * measurements. The flat `len/3.5` heuristic under-counts code and
+ * tool-result JSON by 15-25 % because those payloads have dense punctuation
+ * and no word structure to benefit from BPE merges.
+ *
+ * These numbers come from sampling Anthropic's tokenizer against
+ * representative Dodo traffic (code files, tool outputs, chat messages).
+ * Keep conservative — safer to over-estimate than to trip the context
+ * limit mid-step.
+ */
+const CHARS_PER_TOKEN_PROSE = 4.0;
+const CHARS_PER_TOKEN_CODE = 2.9;
+const CHARS_PER_TOKEN_JSON = 2.6;
+const CHARS_PER_TOKEN_DEFAULT = 3.3;
+
+/**
+ * Heuristically classify a string and return its chars-per-token ratio.
+ * Cheap: one pass over a small prefix.
+ */
+function charsPerTokenFor(sample: string): number {
+  if (sample.length === 0) return CHARS_PER_TOKEN_DEFAULT;
+  // Cap the sample — we only need a signal, not full-text analysis
+  const head = sample.length > 2048 ? sample.slice(0, 2048) : sample;
+  const punctCount = (head.match(/[{}[\]":,;=<>()]/g) ?? []).length;
+  const braceCount = (head.match(/[{}[\]]/g) ?? []).length;
+  const wordCount = (head.match(/[A-Za-z]{3,}/g) ?? []).length;
+  const totalChars = head.length;
+
+  // JSON-dominated: lots of quote/brace/colon punctuation relative to chars
+  if (braceCount >= 3 && punctCount / totalChars > 0.1) return CHARS_PER_TOKEN_JSON;
+  // Code-ish: dense punctuation plus enough word tokens to suggest
+  // identifiers rather than natural prose
+  if (punctCount / totalChars > 0.08 && wordCount >= 5) return CHARS_PER_TOKEN_CODE;
+  // Prose: many multi-character words, sparse punctuation
+  if (wordCount > totalChars / 30 && punctCount / totalChars < 0.05) return CHARS_PER_TOKEN_PROSE;
+  return CHARS_PER_TOKEN_DEFAULT;
+}
+
+/**
+ * Pure cache-decision helper. Returns true when a cached value is fresh
+ * enough to reuse (non-zero `cachedAt` and within the TTL window). Pulled
+ * out of `connectMcpServers()` / `warmSkills()` so it can be unit-tested
+ * without spinning up a Durable Object.
+ *
+ * `cachedAt === 0` is the convention for "no cache yet, must (re)fetch".
+ */
+export function isCacheFresh(cachedAt: number, ttlMs: number, now = Date.now()): boolean {
+  if (cachedAt === 0) return false;
+  return now - cachedAt < ttlMs;
+}
+
+/**
+ * Pure helper that returns true when a TTL-cached value with a fingerprint
+ * is still valid. Used by `connectMcpServers()` to decide whether to skip
+ * the reconnect storm. The fingerprint guards against the case where the
+ * cache is "fresh" by TTL but the underlying inputs have changed (e.g.
+ * user toggled an MCP server off).
+ */
+export function isFingerprintedCacheFresh(
+  cachedAt: number,
+  cachedFingerprint: string | null,
+  currentFingerprint: string,
+  ttlMs: number,
+  now = Date.now(),
+): boolean {
+  if (cachedAt === 0) return false;
+  if (cachedFingerprint !== currentFingerprint) return false;
+  return now - cachedAt < ttlMs;
+}
+
+/**
+ * Per-message token-estimate cache. Messages are immutable once appended to
+ * a Think conversation, so the estimate is stable for the lifetime of the
+ * object — keyed by the ModelMessage reference so it gets garbage-collected
+ * when the message drops out of the conversation array.
+ *
+ * Eliminates the per-turn JSON.stringify storm: `estimateMessagesTokens()`
+ * is called 3–4 times per step (pre-step budget check, oversized-prompt
+ * guard, compaction threshold checks), and each call previously re-walked
+ * every message. With this cache, only newly-appended messages get
+ * stringified.
+ */
+const tokenEstimateCache = new WeakMap<ModelMessage, number>();
+
+/**
+ * Token estimate for a single ModelMessage. Content-aware: picks a
+ * chars-per-token ratio based on the message role/shape so prose, JSON
+ * tool args, and code blocks all land within ~10% of the real count.
+ *
+ * Used for our pre-step budget check and the loop-entry oversized-prompt
+ * guard. We trade a tiny bit of accuracy for not having to ship a real
+ * tokenizer into the Worker — a false-positive triggers compaction, a
+ * false-negative "just squeeze it in" is a 429.
+ *
+ * Cached per-message reference via `tokenEstimateCache` — cheap to call
+ * repeatedly within a turn.
+ */
+export function estimateMessageTokens(msg: ModelMessage): number {
+  const cached = tokenEstimateCache.get(msg);
+  if (cached !== undefined) return cached;
+  const serialized = JSON.stringify(msg);
+  const cpt = charsPerTokenFor(serialized);
+  const result = Math.ceil(serialized.length / cpt);
+  tokenEstimateCache.set(msg, result);
+  return result;
+}
+
+/**
+ * Sum of estimateMessageTokens across an array. Used by the pre-step budget
+ * check and the loop-entry oversized-prompt guard in onChatMessage().
+ *
+ * Hits the per-message cache so calling this repeatedly within a turn is
+ * O(messages) lookups, not O(messages × stringify-cost).
+ */
+export function estimateMessagesTokens(messages: ModelMessage[]): number {
+  let total = 0;
+  for (const m of messages) total += estimateMessageTokens(m);
+  return total;
+}
+
+/**
+ * Image attachment limits — keep in sync with `public/js/dodo-chat.js`.
+ * Base64 encodes 3 bytes → 4 chars, so MAX_IMAGE_BASE64_LENGTH ≈ MAX_IMAGE_BYTES * 4/3.
+ * Kept tight to protect the DO isolate: 5 images × 4MB base64 = 20MB peak payload.
+ */
+const MAX_IMAGES_PER_MESSAGE = 5;
+const MAX_IMAGE_BASE64_LENGTH = 4_000_000; // ~3MB decoded per image
+const ALLOWED_IMAGE_MEDIA_TYPES = /^image\/(png|jpeg|gif|webp|svg\+xml)$/;
+// Sampled base64 validation — avoids running a regex across a multi-MB string, which
+// is expensive in the DO isolate. Base64 must have length divisible by 4; the head/tail
+// sampling catches most corruption without the full scan. convertToLanguageModelV3DataContent
+// in the AI SDK will surface any deeper decoding errors at send time.
+const BASE64_SAMPLE_REGEX = /^[A-Za-z0-9+/]+=*$/;
+const isLikelyBase64 = (s: string): boolean => {
+  if (s.length % 4 !== 0) return false;
+  const head = s.slice(0, 128);
+  const tail = s.slice(-128);
+  return BASE64_SAMPLE_REGEX.test(head) && BASE64_SAMPLE_REGEX.test(tail);
+};
+const imageAttachmentSchema = z.object({
+  data: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH).refine(isLikelyBase64, "Invalid base64"),
+  mediaType: z.string().regex(ALLOWED_IMAGE_MEDIA_TYPES),
+}).strict();
+const sendMessageSchema = z.object({
+  content: z.string().trim().min(1),
+  images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_MESSAGE).optional(),
+}).strict();
+/** /generate schema — FLUX-1-schnell rejects >2048 chars, so enforce at the edge. */
+const generateImageSchema = z.object({
+  content: z.string().trim().min(1).max(FLUX_MAX_PROMPT_LENGTH),
+}).strict();
+const executeCodeSchema = z.object({ code: z.string().trim().min(1) }).strict();
+const gitCommitSchema = z.object({ dir: z.string().optional(), message: z.string().trim().min(1) }).strict();
+const gitCloneSchema = z.object({ branch: z.string().optional(), depth: z.number().int().nonnegative().optional(), dir: z.string().optional(), singleBranch: z.boolean().optional(), url: z.string().url() }).strict();
+const gitDirSchema = z.object({ dir: z.string().optional(), filepath: z.string().optional() }).strict();
+const gitBranchSchema = z.object({ delete: z.string().optional(), dir: z.string().optional(), list: z.boolean().optional(), name: z.string().optional() }).strict();
+const gitCheckoutSchema = z.object({ branch: z.string().optional(), dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional() }).strict();
+const gitRemoteSchema = z.object({ add: z.object({ name: z.string().min(1), url: z.string().url() }).optional(), dir: z.string().optional(), list: z.boolean().optional(), remove: z.string().optional() }).strict();
+const cronCreateSchema = z.discriminatedUnion("type", [
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("delayed"), delayInSeconds: z.number().int().positive() }).strict(),
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("scheduled"), date: z.string().datetime() }).strict(),
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("cron"), cron: z.string().min(1) }).strict(),
+  z.object({ description: z.string().min(1), prompt: z.string().min(1), type: z.literal("interval"), intervalSeconds: z.number().int().positive() }).strict(),
+]);
+const replaceFileSchema = z.object({ replacement: z.string(), search: z.string().min(1) }).strict();
+const searchFilesSchema = z.object({ pattern: z.string().min(1), query: z.string().default("") }).strict();
+const writeFileSchema = z.object({ content: z.string(), mimeType: z.string().optional() }).strict();
+
+/**
+ * Sanitize workspace filesystem timestamps.
+ * Container filesystems can report epoch-zero or overflow timestamps that
+ * serialize to dates thousands of years in the future. Return null for those
+ * instead of corrupted ISO strings.
+ */
+function sanitizeTimestamp(epochSeconds: number): string | null {
+  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return null;
+  // Reject dates beyond year 2100 — almost certainly a filesystem bug
+  if (epochSeconds > 4_102_444_800) return null;
+  return new Date(epochSeconds * 1000).toISOString();
+}
+
+/** System prompt aligned with Think's real workspace tools. */
+const SYSTEM_PROMPT = [
+  "You are Dodo, an autonomous coding agent running on Cloudflare Workers.",
+  "You help users build, modify, and understand software projects inside a sandboxed workspace.",
+  "",
+  "## Tone and style",
+  "",
+  "Be concise and direct. Prefer concrete actions over long explanations.",
+  "Use GitHub-flavored markdown for formatting.",
+  "Only use emojis if the user explicitly requests them.",
+  "Never create files unless necessary to achieve the goal — prefer editing existing files.",
+  "",
+  "## Doing tasks",
+  "",
+  "**Default to planning with todos.** For any request where you're not sure you can finish in one tool call, call `todo_add` first, lay out the steps, then work through them with `todo_update`. Todos survive context compaction — they're the single most reliable way to preserve your plan across long sessions.",
+  "",
+  "**Requests that ALWAYS need todos** (even if they seem simple):",
+  "",
+  "- Anything involving a cloned repo (\"what's new in X?\", \"review commits since Y\", \"check the README against recent changes\")",
+  "- Multi-file work (\"update imports across src/\", \"rename X to Y\", \"add tests for Z\")",
+  "- Investigate-then-report tasks (\"find all usages\", \"summarise what changed\", \"audit for Z\")",
+  "- Any task with the words \"review\", \"investigate\", \"check\", \"audit\", \"update docs\", \"compare\"",
+  "",
+  "**Requests that can skip todos:**",
+  "",
+  "- A single tool call (\"read this file\", \"show git status\", \"fix this typo on line 42\")",
+  "- Direct factual questions that don't need tool use",
+  "",
+  "### How to use todos mid-task",
+  "",
+  "- You complete a step → `todo_update` to mark it `completed` before moving on. One `in_progress` at a time.",
+  "- A step turns out bigger than expected → `todo_add` the subtasks.",
+  "- Context is getting dense (many tool results accumulated) → call `todo_list` to re-ground yourself before the next action. This is especially important after an auto-continuation — the summary won't list your todos, so `todo_list` is how you remember the plan.",
+  "",
+  "### Delegate bounded work with `task`",
+  "",
+  "For sub-jobs that will take 3+ of your own steps and don't need the full conversation context, call `task` with a self-contained prompt. The subagent runs in its own context window and returns a compact summary. Use cases:",
+  "",
+  "- \"review these 6 files and report any dead code\" → `task`",
+  "- \"update all imports of X to Y across src/\" → `task`",
+  "- \"run the test suite and summarise failures\" → `task`",
+  "",
+  "Don't use `task` for a single lookup (just call the tool) or for anything the main conversation needs to see in detail.",
+  "",
+  "### Standing rules",
+  "",
+  "1. **Check memory first.** If a memory MCP is connected, search it for patterns, decisions, or prior work related to the task.",
+  "2. **Prefer authoritative sources over web search.** Some MCP tools talk to authoritative systems (the Cloudflare API, the user's memory store, a Jira/GitHub integration, the workspace itself); others (you-search, brave-search, tavily, fetch-based scrapers) do generic web search. **Always reach for the authoritative source first when one exists for the question.** Use web-search tools for: current events, things outside your knowledge cutoff, open-web research, finding third-party docs you don't already have a direct integration for. Do NOT use web search for: facts retrievable from a connected first-party API, codebase questions answerable via `explore`/`grep`, anything the user's memory store has indexed. If you're unsure whether an authoritative tool exists, list your tools first.",
+  "3. **Use `explore` for ALL codebase discovery.** When you need to find where something is defined, understand how a feature works, or locate relevant files — use `explore`. Do NOT use `read`, `list`, `find`, or `grep` for open-ended exploration. `explore` runs a search agent in a separate context window and returns a compact summary. Using direct tools for discovery will exhaust your context budget before you can make any edits.",
+  "",
+  "   Examples of when to use `explore`:",
+  "   - 'Where is the config schema defined?' → `explore`",
+  "   - 'How does the settings UI work?' → `explore`",
+  "   - 'Find all files related to git author' → `explore`",
+  "",
+  "   Examples of when to use direct tools:",
+  "   - You already know the file and line numbers → `read` with offset/limit",
+  "   - You need to make an edit → `edit`",
+  "   - You need to search for a specific string → `grep`",
+  "",
+  "4. **Read only what you need.** After `explore` tells you which files and lines matter, use `read` with `offset`/`limit` to fetch only the sections you need to edit.",
+  "5. **Plan, then edit.** State your plan in one short paragraph (or a todo list, preferred), then execute. Don't narrate each step.",
+  "6. **Stay focused.** Only make changes that are directly requested or clearly necessary.",
+  "7. **Know when to stop.** When you have enough information to answer the user (or have completed the requested change), write your conclusion as a plain-text response and stop calling tools. Do NOT keep making speculative tool calls 'to be thorough' — every extra call costs context and the user is waiting. Specifically:",
+  "   - If three consecutive tool calls have produced no new useful information, write what you have and stop.",
+  "   - If you have answered the user's question, do not run more tools to 'verify'.",
+  "   - If a tool keeps returning errors, write what failed and stop — don't retry with minor variations.",
+  "   - Your final reply should always be plain text, never a tool call.",
+  "8. **Commit completed work only.** When you finish a coherent, working chunk in a git repo, stage and commit it before you reply unless the user explicitly says not to commit. Don't commit half-finished scaffolding or partial changes that would break the build. If your context runs out mid-task, commit what's complete and describe what remains.",
+  "9. **Delete unused code.** No commented-out code, no `_unused` renames.",
+  "10. **Be security-conscious.** Never commit secrets or credentials.",
+  "",
+  "## Workspace tools",
+  "",
+  "You have workspace tools for file operations:",
+  "",
+  "| Tool | Purpose | Key params |",
+  "|------|---------|------------|",
+  "| **explore** | Search agent for codebase discovery (compact summary) | `query`, `scope` |",
+  "| **task** | Delegate a bounded sub-task to a fresh subagent (read+write workspace tools) | `prompt`, `scope?` |",
+  "| **read** | Read file contents | `path`, `offset`, `limit` (line numbers) |",
+  "| **write** | Create or overwrite a file | `path`, `content` |",
+  "| **edit** | Find-and-replace (unique match) | `path`, `old_string`, `new_string` |",
+  "| **replace_all** | Replace ALL occurrences of a string | `path`, `old_string`, `new_string` |",
+  "| **grep** | Search file contents by regex | `query`, `include` (glob filter) |",
+  "| **delete** | Remove a file or directory | `path`, `recursive` |",
+  "| **todo_list** | List session todos with status and priority | — |",
+  "| **todo_add** | Append a todo | `content`, `priority?` |",
+  "| **todo_update** | Update todo `status`, `content`, or `priority` | `id`, `status?`, ... |",
+  "| **todo_clear** | Clear all todos | — |",
+  "| **typecheck** | Run TypeScript `tsc --noEmit` against the workspace and return diagnostics | `dir?`, `extraStrict?` |",
+  "| **shell** | Run busybox shell commands (pipes, redirection, coreutils) against `/workspace` | `commands[]`, `cwd?`, `env?`, `timeoutMs?` |",
+  "",
+  "### Shell feedback loop",
+  "",
+  "Use `shell` for file-shaped work that's awkward in `codemode` — pipelines, redirection, coreutils:",
+  "",
+  "- `shell({ commands: [\"grep -rn TODO /workspace/src | head -20\"] })` — single pipeline, one tool call.",
+  "- Batch related commands: `shell({ commands: [\"ls -la /workspace\", \"wc -l /workspace/src/*.ts\"] })` — saves LLM turns vs N calls.",
+  "",
+  "**Path translation — read this carefully.** The other tools (`read`, `write`, `edit`, `grep`, `delete`) take **workspace paths** that start with `/`. The `shell` tool mounts that same workspace **at `/workspace`**, so:",
+  "",
+  "- `write({ path: \"/notes.md\", ... })` creates the file at workspace path `/notes.md`.",
+  "- That same file is visible to `shell` as **`/workspace/notes.md`** — the `/workspace` prefix is added by the shell mount, NOT something you put in the `write` path.",
+  "- Never pass `/workspace/foo` to `write`/`read`/`edit` — that would create a *nested* file at workspace path `/workspace/foo` (visible to `shell` as `/workspace/workspace/foo`). Just use `/foo`.",
+  "- If a repo is cloned via `codemode` git tools to dir `dodo`, the files are at workspace path `/dodo/...` and shell path `/workspace/dodo/...`.",
+  "",
+  "Other shell facts:",
+  "",
+  "- Use absolute shell paths under `/workspace` (e.g. `/workspace/src/foo.ts`). Each call gets a fresh isolate; file changes persist back to the workspace but shell state (cwd, env exports, shell vars) does not.",
+  "- Available: `sh`, `cat`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `find`, `grep`, `sed`, `awk`, `head`, `tail`, `wc`, `sort`, `uniq`, `tr`, `cut`, `xargs`, `tar`, `gzip`. Run `busybox --list` for the full set.",
+  "- Not available: `npm`, `node`, `python`, `git`, `tsc`, network (`wget`/`curl` over TLS). Use `typecheck` for tsc; use `codemode` + `git.*` for git; use `codemode` for fetch.",
+  "- Combined output cap: 32 KB per call. Narrow with `head`, `-m`, `find -maxdepth` if you hit `truncated: true`.",
+  "",
+  "Prefer `shell` over a multi-step `codemode` block when the work is a single pipeline. Prefer `codemode` when you need typed JS, structured data, or git/network operations.",
+  "",
+  "### Typecheck feedback loop",
+  "",
+  "Use `typecheck` after editing TypeScript code to confirm it compiles before committing or pushing. The tool runs the real TypeScript compiler in-isolate (no shell, no `npm`) and returns structured diagnostics with file paths, line numbers, error codes, and messages — feed those back into your next edit.",
+  "",
+  "- Honours the project's `tsconfig.json` if one is present at the workspace root or under the dir you pass.",
+  "- Pass `extraStrict: true` to also catch unused locals, unused parameters, missing returns, and switch fall-through. There's no in-isolate linter — `extraStrict` is the cheap stand-in for one.",
+  "- Refuses projects with > 50 .ts/.tsx files or > 5 MB of source. Pass `dir` to scope the check to a subdirectory if you hit that.",
+  "- The first call is slower (~1-3 s) because it loads the compiler; subsequent calls in the same session reuse it.",
+  "",
+  "### Token budget",
+  "",
+  "Your context window is shared across all tool calls in a single prompt. Every file you read, every tool result — it all accumulates. If you exhaust the budget on reading, you won't have room to edit.",
+  "",
+  "- **`explore` first, `read` second.** Use `explore` for any question about the codebase (where is X defined? how does Y work?). Use `read` only for the specific lines you need to edit.",
+  "- **Use `read` with `offset` and `limit`.** Don't read a 2000-line file if you only need lines 50-80.",
+  "- **Use `edit` instead of `write`** for targeted changes. Rewriting an entire file wastes context.",
+  "- **Use `grep` to find specific lines** before reading. It returns line numbers — use those to read the exact range.",
+  "- **Never read the same file twice** unless it changed.",
+  "- **Avoid generated/lock files** (package-lock.json, *.min.js, *.map).",
+  "",
+  "## Code execution",
+  "",
+  "The **codemode** tool runs JavaScript in a sandboxed Worker with access to the workspace filesystem and git.",
+  "Use it for: build scripts, tests, one-off computations, or calling external APIs via fetch(). Outbound hosts must be on the admin allowlist (catalog hosts like api.githubcopilot.com are pre-allowed). Auth headers are NOT injected automatically — include any required tokens in your fetch() call yourself, or use the git_* tools which handle auth in the parent worker.",
+  "The sandbox has a 30-second timeout and restricted network access.",
+  "",
+  "## Git",
+  "",
+  "Git is split across two surfaces:",
+  "",
+  "**Top-level tools** (call directly): `git_status`, `git_add`, `git_commit`, `git_diff`. These are the hot path — used every turn you touch a repo.",
+  "",
+  "**Inside codemode** (call via `git.<name>` from a codemode JS block): `git_clone_known`, `git_clone`, `git_push`, `git_push_checked`, `git_pull`, `git_branch`, `git_checkout`, `git_log`, `git_verify_remote_branch`, `pr_create`. Example:",
+  "",
+  "```",
+  "codemode({ code: `async () => { await git.git_clone_known({ repoId: \"dodo\" }); return git.git_log({ depth: 5 }); }` })",
+  "```",
+  "",
+  "Authentication for GitHub and GitLab is automatic for the `git_*` tools — you do NOT need tokens for clone/push/pull/fetch. Raw `fetch()` from the codemode sandbox is unauthenticated; if you need to call e.g. `api.github.com` directly, include the token in the request yourself or prefer a `git_*` tool.",
+  "",
+  "### Clone depth — pick the right one up front",
+  "",
+  "`git.git_clone` / `git.git_clone_known` default to **depth 20 commits**. That's the right choice for most tasks. Override when the task signals otherwise:",
+  "",
+  "- User asks \"what's new / recent changes / since commit X / review the latest updates\" → stick with default 20 (or pass `depth: 50` if they mention a period longer than ~2 weeks).",
+  "- User wants blame / full history / bisect → pass `depth: 0` for full history.",
+  "- User just wants to read or edit the current tree (no log-reading needed) → pass `depth: 1` to save bandwidth.",
+  "",
+  "Never clone twice. If `git.git_log` returns fewer commits than you need, deepen the existing clone with a second `git.git_clone` to the same `dir` — do NOT re-clone from scratch to a new directory.",
+  "",
+  "### Git safety rules",
+  "",
+  "- Always run git_status before committing.",
+  "- Stage specific files, not '.' (unless you intend to commit everything).",
+  "- Write clear, concise commit messages that explain *why*.",
+  "- Never force-push unless the user explicitly asks.",
+  "- Prefer `git.git_clone_known` for built-in repos. Use `git.git_push_checked` with an explicit branch ref.",
+  "- **You are running in a sandboxed clone — never use `git worktree`.** The workspace IS the clone; there is no parent directory to share with and no concurrent agent to collide with. Repo AGENTS.md files written for local opencode-CLI use sometimes mention worktrees — that guidance does not apply to you. Branch directly off `main` via codemode (`git.git_checkout`) and push the branch with `git.git_push_checked`.",
+  "- **Open the PR before you reply.** When the user asks for a PR: push the branch with `git.git_push_checked`, then call `git.pr_create` (both inside codemode) to open a draft PR/MR and quote the URL it returns. `pr_create` works for GitHub and GitLab, auto-detects the provider, and auto-fills the title and body from your latest commit. Don't make the user ask \"where's the PR?\" — that's a workflow failure. If `git.pr_create` fails (e.g. missing token), fall back to constructing `https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1` and tell the user what's missing.",
+  "- **Diagnostic vs imperative phrasing.** If the user asks \"what should we update / what's changed / what do you think\" — that's a DIAGNOSTIC question. Propose changes but do NOT apply them or commit without explicit instruction (\"update it\", \"apply the fix\", \"yes please do\"). When in doubt, ask.",
+  "",
+  "## Working with errors",
+  "",
+  "When something fails: state what failed, fix it, move on. Don't apologize repeatedly.",
+  "",
+  "## Context management",
+  "",
+  "**Every tool result stays in your context window.** This is the most important constraint.",
+  "",
+  "- Your context budget is limited. Plan efficiently — use `explore` for discovery, then targeted reads for edits.",
+  "- Large outputs are automatically truncated. If you see `[truncated]`, use `read` with `offset`/`limit` to get the specific portion you need.",
+  "- The workspace is ephemeral per session. Clone repos to get their contents.",
+  "- If the user switches topics, suggest a fresh session to keep context clean.",
+  "- Users can prefix a message with `!!` to minimize its context footprint. You'll see `[message excluded by user]` as a placeholder instead of the original content.",
+].join("\n");
+
+/** Build a LanguageModel from DodoConfig (Think per-session config). */
+function buildProviderFromConfig(config: DodoConfig, env: Env): LanguageModel {
+  const appConfig: AppConfig = {
+    activeGateway: config.activeGateway,
+    aiGatewayBaseURL: config.aiGatewayBaseURL,
+    gitAuthorEmail: config.gitAuthorEmail,
+    gitAuthorName: config.gitAuthorName,
+    model: config.model,
+    opencodeBaseURL: config.opencodeBaseURL,
+  };
+  return buildProvider(appConfig, env).chatModel(config.model);
+}
+
+// normalizePath imported at top of file from ./paths
+
+/**
+ * Thrown when a caller references a facet name that has no run history
+ * on this session. Maps to HTTP 404 at the request boundary.
+ */
+class FacetNotFoundError extends Error {
+  constructor(public readonly facetName: string) {
+    super(`facet not found: ${facetName}`);
+    this.name = "FacetNotFoundError";
+  }
+}
+
+export class CodingAgent extends Think<Env, DodoConfig> {
+  initialState: SessionState = {
+    activePromptId: null,
+    activeStreamCount: 0,
+    compactionCount: 0,
+    contextBudget: 0,
+    contextUsagePercent: 0,
+    contextWindow: 0,
+    createdAt: "",
+    messageCount: 0,
+    model: "",
+    sessionId: "",
+    status: "idle",
+    totalTokenInput: 0,
+    totalTokenOutput: 0,
+    updatedAt: "",
+  };
+
+  /** Enable durable fiber recovery for async prompts. */
+  override fibers = true;
+
+  private readonly clients = new Map<WritableStreamDefaultWriter<Uint8Array>, Promise<void>>();
+  /** Captured token usage from the most recent onChatMessage() call. */
+  private _lastUsage: { inputTokens: number; outputTokens: number } | null = null;
+  /** Overflow recovery flag — prevents infinite retry loops on persistent overflow. */
+  private _overflowRecoveryAttempted = false;
+  /** Set by assembleContext() when messages are dropped due to token budget. */
+  private _contextTruncated = false;
+  /** Connected MCP gatekeepers, populated by connectMcpServers(). */
+  private mcpGatekeepers: McpClient[] = [];
+  /**
+   * Epoch ms of the last successful (non-empty) `connectMcpServers()` run.
+   * Used together with `MCP_REFRESH_TTL_MS` and `mcpEnabledConfigsFingerprint`
+   * to short-circuit the per-turn reconnect storm. Previously every chat turn
+   * disconnected and reconnected every enabled MCP gatekeeper (7+ servers
+   * including two cf-portal instances exposing ~200 tools each), which cost
+   * 500ms–2s per turn. With the cache, reconnect happens at most once per
+   * TTL window or when the enabled-config set actually changes.
+   */
+  private mcpConnectedAt = 0;
+  /**
+   * Fingerprint of the enabled MCP config IDs from the last successful
+   * connect. If this changes (user enables/disables a server, session
+   * override flips), we drop the cache and reconnect.
+   */
+  private mcpEnabledConfigsFingerprint: string | null = null;
+  /** TTL in ms for the cached MCP gatekeeper set. */
+  private static readonly MCP_REFRESH_TTL_MS = 5 * 60_000;
+  /**
+   * Per-config connect status from the most recent `connectMcpServers()` call.
+   * Surfaced via `GET /mcp-status` so the UI can show "✗ tools/list failed:
+   * Invalid Bearer token format" instead of silently dropping tools.
+   *
+   * Keyed by MCP config id. Includes both successful and failed attempts.
+   * OAuth-federated tools are not included here — those live in the hub DO.
+   */
+  private mcpStatus: Map<string, {
+    name: string;
+    url?: string;
+    ok: boolean;
+    toolCount?: number;
+    error?: string;
+    lastCheckedAt: number;
+  }> = new Map();
+  /**
+   * OAuth MCP tools federated from the per-user hub DO.
+   *
+   * Session DOs (keyed by sessionId) don't hold OAuth state — it lives in
+   * the user-keyed DO created by /api/mcp/start-auth. We pre-fetch the tool
+   * list once per `connectMcpServers()` call and cache it here so that the
+   * synchronous `getTools()` path can merge it into the session's toolset.
+   * Tool calls route back to the hub via `callOAuthTool` RPC.
+   */
+  private cachedOAuthTools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }> = [];
+  /** MCP recursion depth from incoming request, propagated to outbound MCP calls. */
+  private mcpDepth = 0;
+  /** AbortController for the currently running fiber prompt. Signalled by handleAbort(). */
+  private _fiberAbortController: AbortController | null = null;
+  /**
+   * Cached project-instructions content (AGENTS.md / CLAUDE.md) loaded from
+   * the workspace. Warmed by `warmProjectInstructions()` at the top of
+   * `onChatMessage()`, consumed synchronously by `getSystemPrompt()`.
+   *
+   * `null` = not yet found. We retry the search each turn until something
+   * is found (which matters for sessions where the user clones a repo on
+   * turn 1 — the AGENTS.md only exists after the clone lands). Once found,
+   * the result is stable for the session (prompt-cache friendly).
+   */
+  private _projectInstructions: string | null = null;
+  /**
+   * Cached skill set (personal + workspace + builtin) merged into one
+   * deduplicated list. Warmed by `warmSkills()` before each turn so
+   * `getSystemPrompt()` and the `skill` tool can read synchronously.
+   *
+   * Personal skills come from UserControl DO (per-user). Workspace skills
+   * are scanned from the cloned repo's `.claude/skills/`, `.opencode/skill/`
+   * etc. directories. Built-in skills ship with Dodo. Last write wins by
+   * source precedence: personal > workspace > builtin.
+   */
+  private _skills: Skill[] | null = null;
+  /** Pre-rendered `<available_skills>` block — recomputed when `_skills` changes. */
+  private _skillManifest: string | null = null;
+  /**
+   * Last successful `warmSkills()` epoch ms. Used together with `SKILLS_TTL_MS`
+   * to short-circuit the personal-skill HTTP fetch + workspace SKILL.md scan
+   * on subsequent turns. Mutations happen out-of-process (skill_write MCP tool
+   * writes to UserControl from a different Worker), so we can't push-invalidate
+   * — a short TTL is the right trade-off. `bumpSkillsGeneration()` provides
+   * an explicit invalidation hook for in-DO callers.
+   */
+  private _skillsWarmedAt = 0;
+  /** TTL in ms for the cached skills manifest. Mirrors ADMIN_PREFIX_TTL_MS. */
+  private static readonly SKILLS_TTL_MS = 60_000;
+  /**
+   * Admin-managed global system-prompt prefix from SharedIndex. Cached on
+   * the DO with a TTL so we don't hit SharedIndex every turn. Refreshed by
+   * `warmGlobalPrompt()` before the prompt is composed.
+   */
+  private _adminPrefix: string | null = null;
+  private _adminPrefixFetchedAt = 0;
+  /** TTL in ms for the cached admin prefix. Short enough that admin edits propagate fast. */
+  private static readonly ADMIN_PREFIX_TTL_MS = 60_000;
+  /**
+   * Per-tool-call attachment references captured during streaming. Populated
+   * by the `onToolAttachments` callback threaded into `buildToolsForThink`.
+   * Cleared per chat turn in `runThinkChat` so attachments from one prompt
+   * don't bleed into the next. Used to enrich the streamed `tool_result`
+   * SSE event with images produced by the tool.
+   */
+  private _toolAttachments: Map<string, AttachmentRef[]> = new Map();
+
+  /** Names of tools called during the current turn. Populated by
+   *  runThinkChat from the stream's `tool-input-available` chunks.
+   *  Used by runFiberPrompt's post-completion check (chat-monitor
+   *  brains nudge themselves if they didn't call chat_reply). */
+  private _toolCallNames: Set<string> = new Set();
+  private readonly presence = new PresenceTracker();
+  readonly stateBackend;
+  private readonly transports = new Map<string, AgentConnectionTransport>();
+  readonly workspace: Workspace;
+  /**
+   * Typed stores wrapping the `metadata` k/v table. See ADR-0001.
+   * Constructed before the lifecycle so it can take them as dependencies.
+   */
+  private readonly metadataKv: MetadataKv;
+  private readonly control: SessionControlPlane;
+  private readonly goalStore: GoalStateStore;
+  private readonly watchdogStore: WatchdogState;
+  /**
+   * The single front door for prompt transitions. See ADR-0001 and
+   * src/session-lifecycle.ts. Consumes the four stores above plus a
+   * FiberDriver adapter over Think's inherited fiber methods.
+   */
+  private readonly lifecycle: SessionLifecycle;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.initializeSchema();
+    this.workspace = new Workspace({
+      name: () => this.sessionId() || "session-pending",
+      r2: env.WORKSPACE_BUCKET,
+      sql: ctx.storage.sql,
+    });
+    this.stateBackend = createWorkspaceStateBackend(this.workspace);
+
+    // ─── Typed stores + SessionLifecycle wiring (ADR-0001) ───
+    //
+    // The MetadataKv port wraps the existing `metadata` SQL table so the
+    // stores have no DDL of their own yet — they're typed lenses over the
+    // same k/v rows that readMetadata/writeMetadata/deleteMetadata use.
+    this.metadataKv = {
+      read: (key) => {
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT value FROM metadata WHERE key = ?", key))[0] as SqlRow | null);
+        return row ? String(row.value) : null;
+      },
+      write: (key, value) => {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+          key,
+          value,
+          nowEpoch(),
+        );
+      },
+      delete: (key) => {
+        this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", key);
+      },
+    };
+    this.control = createSessionControlPlane(this.metadataKv);
+    this.goalStore = createGoalStateStore(this.metadataKv);
+    this.watchdogStore = createWatchdogState(this.metadataKv);
+
+    this.lifecycle = createSessionLifecycle({
+      control: this.control,
+      goal: this.goalStore,
+      fibers: {
+        spawnFiber: (method, payload, opts) =>
+          this.spawnFiber(method as never, payload as never, opts),
+        cancelFiber: (id) => this.cancelFiber(id),
+        readPromptFiberId: (promptId) => this.readPromptFiberId(promptId),
+        setPromptFiberId: (promptId, fiberId) => this.setPromptFiberId(promptId, fiberId),
+      },
+      prompts: {
+        insert: ({ promptId, content, status, source }) =>
+          this.insertPrompt(promptId, content, status, source),
+        update: (promptId, patch) => this.updatePrompt(promptId, patch),
+        enqueue: (content, authorEmail) => {
+          const id = crypto.randomUUID();
+          const now = nowEpoch();
+          const maxRow = (Array.from(this.ctx.storage.sql.exec("SELECT MAX(position) as max_pos FROM prompt_queue"))[0] as SqlRow | null);
+          const position = maxRow?.max_pos != null ? Number(maxRow.max_pos) + 1 : 1;
+          this.ctx.storage.sql.exec(
+            "INSERT INTO prompt_queue (id, content, author_email, created_at, position) VALUES (?, ?, ?, ?, ?)",
+            id,
+            content,
+            authorEmail ?? null,
+            now,
+            position,
+          );
+          this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+          return { promptId: id, position };
+        },
+        dequeue: () => {
+          const next = (Array.from(this.ctx.storage.sql.exec("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1"))[0] as SqlRow | null);
+          if (!next) return null;
+          const id = String(next.id);
+          this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", id);
+          return {
+            promptId: id,
+            content: String(next.content),
+            authorEmail: next.author_email ? String(next.author_email) : null,
+          };
+        },
+        emitQueueUpdate: () => this.emitEvent({ data: this.readQueueState(), type: "queue_update" }),
+      },
+      emit: (event) => this.emitEvent(event),
+      notify: (n) => dispatchNotification(this.env, this.ctx, n),
+      syncIndex: (patch) => this.syncSessionIndex(patch),
+      getAbortController: () => this._fiberAbortController,
+      setAbortController: (c) => {
+        this._fiberAbortController = c;
+      },
+      readAppConfig: () => this.readAppConfig(),
+      log: (level, message, fields) => log(level, message, fields ?? {}),
+    });
+  }
+
+  // ─── Think overrides ───
+
+  override getModel(): LanguageModel {
+    const config = this.getConfig();
+    if (!config) {
+      throw new Error("getModel(): no Think config — session not configured yet");
+    }
+    return buildProviderFromConfig(config, this.env);
+  }
+
+  override getSystemPrompt(): string {
+    // Gather the optional sections that depend on DO state.
+    const browserEnabled = this.readMetadata("browser_enabled") === "true";
+    const browserSection = browserEnabled
+      ? [
+          "## Browser",
+          "",
+          "You have full browser automation via the Chrome DevTools Protocol (CDP).",
+          "",
+          "**Two tools:**",
+          "- `browser_search` — Write JS to query the CDP spec (~1.7MB, stays server-side). Use this to discover available commands, events, and types before executing them.",
+          "- `browser_execute` — Write JS using a `cdp` helper to run CDP commands against a live headless Chrome session. The session is opened fresh per call and closed after.",
+          "",
+          "**`browser_execute` pattern:**",
+          "A fresh browser with a blank page is launched per call. The CDP session is already attached to that page,",
+          "so you can send page-scoped commands directly:",
+          '1. Enable domains: `cdp.send("Page.enable")`',
+          '2. Navigate: `cdp.send("Page.navigate", { url: "..." })`',
+          '3. Wait for load, then act: `cdp.send("Page.captureScreenshot", { format: "png" })`',
+          "",
+          "**Common tasks:**",
+          '- Navigate + get text: `Page.navigate` → `Runtime.evaluate` with `document.body.innerText`',
+          '- Screenshot: `Page.captureScreenshot` → returns base64 PNG',
+          '- Click/type: `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`',
+          '- Network: `Network.enable` → intercept/monitor requests',
+          '- DOM inspection: `DOM.getDocument` → `DOM.querySelectorAll`',
+          "",
+          "Always use `browser_search` first if you're unsure which CDP method to use.",
+        ].join("\n")
+      : undefined;
+
+    // Inject bounded workspace summary on first turn only.
+    const workspaceSummary =
+      this.messages.length <= 1 ? this.getWorkspaceSummary() ?? undefined : undefined;
+
+    const config = this.getConfig();
+
+    // Goal section — only present when a goal is active. The model sees
+    // its current goal, turn count, and the obligation to call
+    // `set_goal_status` at terminal states.
+    const goalState = this.readGoalState();
+    const goalSection = renderGoalSystemPromptSection(goalState) ?? undefined;
+
+    // Per-session prefix (e.g. chat-monitor brain persona). Layered above
+    // userPrefix so it can override the user's default style for sessions
+    // with a specific role.
+    const sessionPrefix = (this.readMetadata("session_system_prompt_prefix") || "").trim() || undefined;
+    const composedUserPrefix = sessionPrefix
+      ? config?.systemPromptPrefix?.trim()
+        ? `${sessionPrefix}\n\n---\n\n${config.systemPromptPrefix.trim()}`
+        : sessionPrefix
+      : config?.systemPromptPrefix?.trim();
+
+    return assembleSystemPrompt({
+      staticBase: SYSTEM_PROMPT,
+      skillManifest: this._skillManifest ?? undefined,
+      browserSection,
+      goalSection,
+      workspaceSummary,
+      projectInstructions: this._projectInstructions ?? undefined,
+      userPrefix: composedUserPrefix,
+      adminPrefix: this._adminPrefix?.trim() || undefined,
+    });
+  }
+
+  /**
+   * Load project-local agent instructions from the workspace and cache
+   * them on this instance. Called from onChatMessage() before
+   * getSystemPrompt() so the sync accessor can see them.
+   *
+   * Searches (in order) for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+   * `.rules` at the workspace root and the first direct subdirectory (git
+   * clones typically land under `/<repo-name>/`). First match wins. Content
+   * is capped at 6 KB with a middle-truncation notice.
+   *
+   * Idempotent: once attempted (success or miss), won't re-run. Stable
+   * system prompt is friendlier to Anthropic prompt caching.
+   */
+  private async warmProjectInstructions(): Promise<void> {
+    // Skip only if we've already FOUND instructions. If a previous turn
+    // searched an empty workspace and found nothing, retry — the user may
+    // have since cloned a repo. Without this, `git_clone` on turn 1 means
+    // turn 2+ never sees the project's AGENTS.md.
+    if (this._projectInstructions) return;
+
+    const MAX_BYTES = 6_000;
+    const candidates = ["AGENTS.md", "CLAUDE.md"];
+
+    // Build search paths: workspace root + first-level subdirs (common for clones)
+    const searchPaths: string[] = [];
+    for (const name of candidates) {
+      searchPaths.push(`/${name}`);
+    }
+    // Add first-level subdir candidates — most clones land under /<repo>/
+    try {
+      const entries = await this.workspace.readDir("/");
+      for (const entry of entries) {
+        // FileInfo: { name, type: 'file' | 'directory' | 'symlink', ... }
+        if (entry.type === "directory" && entry.name && !entry.name.startsWith(".")) {
+          for (const candidate of candidates) {
+            searchPaths.push(`/${entry.name}/${candidate}`);
+          }
+        }
+      }
+    } catch {
+      // readDir throws if the workspace's SQL tables aren't ready — skip
+      // subdir search and try root-only paths. Not a real error.
+    }
+
+    for (const path of searchPaths) {
+      // Workspace.readFile returns Promise<string | null> — null on miss,
+      // not a throw. No try/catch needed for the normal not-found case.
+      const content = await this.workspace.readFile(path);
+      if (typeof content !== "string" || content.length === 0) continue;
+
+      let trimmed = content.trim();
+      if (trimmed.length > MAX_BYTES) {
+        const head = trimmed.slice(0, Math.floor(MAX_BYTES * 0.7));
+        const tail = trimmed.slice(-Math.floor(MAX_BYTES * 0.2));
+        trimmed = `${head}\n\n[... truncated ${content.length - head.length - tail.length} bytes of ${path} ...]\n\n${tail}`;
+      }
+
+      this._projectInstructions = `Loaded from \`${path}\`:\n\n${trimmed}`;
+      log("info", "project-instructions-loaded", {
+        sessionId: this.sessionId(),
+        path,
+        bytes: trimmed.length,
+      });
+      return;
+    }
+  }
+
+  /**
+   * Force the next `warmSkills()` call to re-fetch from UserControl and
+   * re-scan the workspace. Call this from any in-DO path that mutates the
+   * skill state (session overrides, workspace SKILL.md writes) so the
+   * change is visible immediately rather than waiting up to SKILLS_TTL_MS.
+   */
+  bumpSkillsGeneration(): void {
+    this._skillsWarmedAt = 0;
+  }
+
+  /**
+   * Warm the skill registry. Loads personal skills from UserControl,
+   * scans the workspace for SKILL.md files, and merges built-in skills.
+   * Caches the merged list and the rendered manifest on this instance so
+   * `getSystemPrompt()` can read them synchronously.
+   *
+   * Called from `onChatMessage()` before each turn. TTL-cached (SKILLS_TTL_MS)
+   * so subsequent turns within the window skip the personal-skill HTTP fetch
+   * and workspace scan entirely — this was a 100-300ms per-turn overhead
+   * before the cache landed. If everything fails the session continues with
+   * no skills (degrade gracefully, never block the chat turn).
+   */
+  private async warmSkills(): Promise<void> {
+    // TTL guard — skip re-warm if we have a recent successful result.
+    // Mutations bump _skillsWarmedAt to 0 via bumpSkillsGeneration().
+    if (
+      this._skills !== null &&
+      isCacheFresh(this._skillsWarmedAt, CodingAgent.SKILLS_TTL_MS)
+    ) {
+      return;
+    }
+
+    const ownerEmail = this.readMetadata("owner_email");
+    const personal: Skill[] = [];
+    let sessionOverrides: Array<{ skillName: string; enabled: boolean }> = [];
+    if (ownerEmail) {
+      try {
+        const stub = getUserControlStub(this.env, ownerEmail);
+        const client = createPersonalSkillClient(stub);
+        const list = await client.list();
+        personal.push(...list);
+      } catch (error) {
+        log("warn", "skills-personal-load-failed", {
+          sessionId: this.sessionId(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      // Fetch per-session skill overrides (mirror of MCP overrides). Stored
+      // as `(session_id, skill_name, enabled)` rows on UserControl.
+      try {
+        const stub = getUserControlStub(this.env, ownerEmail);
+        const res = await stub.fetch(`https://user-control/sessions/${encodeURIComponent(this.sessionId())}/skill-overrides`);
+        if (res.ok) {
+          const body = (await res.json()) as { overrides: Array<{ skillName: string; enabled: boolean }> };
+          sessionOverrides = body.overrides ?? [];
+        }
+      } catch (error) {
+        log("warn", "skills-session-overrides-load-failed", {
+          sessionId: this.sessionId(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    let workspace: Skill[] = [];
+    try {
+      workspace = await scanWorkspaceSkills(this.workspace);
+    } catch (error) {
+      log("warn", "skills-workspace-scan-failed", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const builtin = listBuiltinSkills();
+
+    const merged = mergeSkills(personal, workspace, builtin);
+
+    // Apply per-session overrides to the merged list. Absence of an
+    // override means the skill keeps its source-level default (personal
+    // can be off, workspace and builtin default on). The renderManifest
+    // filter on `enabled` does the actual gating.
+    if (sessionOverrides.length > 0) {
+      const overrideMap = new Map(sessionOverrides.map((o) => [o.skillName, o.enabled]));
+      for (const skill of merged) {
+        if (overrideMap.has(skill.name)) {
+          skill.enabled = overrideMap.get(skill.name)!;
+        }
+      }
+    }
+
+    this._skills = merged;
+    this._skillManifest = renderSkillManifest(merged) || null;
+    this._skillsWarmedAt = Date.now();
+    log("info", "skills-warmed", {
+      sessionId: this.sessionId(),
+      personal: personal.length,
+      workspace: workspace.length,
+      builtin: builtin.length,
+      merged: merged.length,
+      sessionOverrides: sessionOverrides.length,
+    });
+  }
+
+  /**
+   * Fetch the admin-managed global system-prompt prefix from SharedIndex
+   * and cache it on this DO. Called from `onChatMessage()` before
+   * `getSystemPrompt()` so the sync accessor can read it. Caches with a
+   * short TTL so admin edits propagate to running sessions within a minute.
+   */
+  private async warmGlobalPrompt(): Promise<void> {
+    const now = Date.now();
+    if (now - this._adminPrefixFetchedAt < CodingAgent.ADMIN_PREFIX_TTL_MS) {
+      return;
+    }
+    try {
+      const stub = this.env.SHARED_INDEX.get(this.env.SHARED_INDEX.idFromName("global"));
+      const response = await stub.fetch("https://shared-index/global-config/system_prompt_prefix");
+      const body = (await response.json()) as { value: string | null };
+      this._adminPrefix = body.value && body.value.trim() ? body.value : null;
+      this._adminPrefixFetchedAt = now;
+    } catch (error) {
+      log("warn", "admin-prefix-fetch-failed", {
+        sessionId: this.sessionId(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Leave the previous cached value in place — better stale than empty.
+    }
+  }
+
+  /**
+   * Resolve a skill by name from the warmed cache. Used by the `skill`
+   * tool to render full content on demand.
+   */
+  getSkillByName(name: string): Skill | null {
+    if (!this._skills) return null;
+    return this._skills.find((s) => s.name === name) ?? null;
+  }
+
+  /** Render the on-demand `skill` tool output for a given skill name. */
+  renderSkillForTool(name: string): string | null {
+    const skill = this.getSkillByName(name);
+    if (!skill) return null;
+    return renderSkillContent(skill);
+  }
+
+  /** List the warmed skills' name + source pairs (used by the skill tool's not-found branch). */
+  listSkillNames(): Array<{ name: string; source: "personal" | "workspace" | "builtin" }> {
+    if (!this._skills) return [];
+    return this._skills.map((s) => ({ name: s.name, source: s.source }));
+  }
+
+  /**
+   * Build a bounded workspace summary — shallow root listing only.
+   * Returns null if the workspace is empty. Capped at ~40 entries
+   * to prevent bloating the system prompt on large repos.
+   */
+  private getWorkspaceSummary(): string | null {
+    try {
+      // Synchronous readDir not available — use the Think workspace's
+      // internal SQL to get a fast root listing without async.
+      const rows = Array.from(this.ctx.storage.sql.exec(
+        "SELECT path, type FROM workspace_entries WHERE parent = '/' ORDER BY type DESC, path ASC LIMIT 40",
+      ));
+      if (!rows.length) return null;
+
+      const lines = rows.map((r) => {
+        const name = String(r.path).split("/").filter(Boolean).pop() ?? String(r.path);
+        return r.type === "directory" ? `${name}/` : name;
+      });
+      const total = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) as cnt FROM workspace_entries WHERE parent = '/'"))[0] as SqlRow | null);
+      const count = Number(total?.cnt ?? lines.length);
+      let result = "```\n" + lines.join("\n") + "\n```";
+      if (count > 40) {
+        result += `\n(${count} entries total, showing first 40)`;
+      }
+      return result;
+    } catch {
+      // workspace_entries table may not exist or be empty — no summary
+      return null;
+    }
+  }
+
+  override getTools(): ToolSet {
+    const appConfig = this.getAppConfigFromThink();
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+    const isChatMonitorBrain = this.readMetadata("is_chat_monitor_brain") === "true";
+    const chatMonitorSpaceId = this.readMetadata("chat_monitor_space_id") || undefined;
+    return buildToolsForThink(this.env, this.workspace, appConfig, {
+      agent: this,
+      // Parent reference for facet-mode explore/task tools.
+      // Typed loosely on the agentic side to avoid a circular import.
+      parentAgent: this,
+      oauthTools: this.cachedOAuthTools,
+      oauthToolExec: (serverId: string, name: string, args: unknown) => this.callOAuthToolViaHub(serverId, name, args),
+      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      isAdminUser: isAdmin(ownerEmail ?? null, this.env),
+      ownerId: this.resolveOwnerId(ownerEmail),
+      ownerEmail,
+      sessionId: this.sessionId(),
+      // Chat-monitor brain context — when set, agentic registers a
+      // first-party `chat_reply` tool with no MCP namespace so the
+      // persona can refer to it by its bare name.
+      isChatMonitorBrain,
+      chatMonitorSpaceId,
+      // Forward tool-produced attachments (e.g. browser_execute screenshots)
+      // to the SSE stream so the chat UI can render them in real time, and
+      // persist them to SQLite so history restore after reload can surface
+      // the same images. Persisted under `message_id = toolCallId` initially;
+      // `runThinkChat` rebinds the rows to the assistant message id after
+      // the stream completes.
+      onToolAttachments: (toolCallId, attachments) => {
+        this._toolAttachments.set(toolCallId, attachments);
+        for (const a of attachments) {
+          this.insertMessageAttachment({
+            messageId: toolCallId,
+            toolCallId,
+            mediaType: a.mediaType,
+            url: a.url,
+            size: a.size,
+            source: "tool",
+          });
+        }
+        this.emitEvent({
+          data: {
+            toolCallId,
+            attachments: rewriteAttachmentsForClient(
+              attachments.map((a) => ({ mediaType: a.mediaType, url: a.url, size: a.size })),
+            ),
+          },
+          type: "tool_attachments",
+        });
+      },
+      stateBackend: this.stateBackend,
+      mcpGatekeepers: this.mcpGatekeepers,
+      todoStore: this.todoStore(),
+    });
+  }
+
+  /**
+   * Override onChatMessage with Dodo's own agentic loop.
+   *
+   * Instead of delegating to AI SDK's internal multi-step loop via
+   * `streamText({ maxSteps: 15 })`, we run a while-loop calling
+   * `streamText({ maxSteps: 1 })` per iteration. This gives us full
+   * control between steps:
+   *
+   * - Reassemble context each iteration (clear old tool results)
+   * - Detect doom loops (same tool+args 3× in a row)
+   * - Enforce token budget thresholds (warn → wrap-up → hard stop)
+   * - Trigger mid-loop compaction when context exceeds threshold
+   * - Abort cleanly on signal
+   *
+   * Returns a custom StreamableResult whose toUIMessageStream() is an
+   * async generator that concatenates chunks from all iterations.
+   */
+  override async onChatMessage(options?: ChatMessageOptions): Promise<StreamableResult> {
+    this._lastUsage = null;
+
+    // Warm project instructions (AGENTS.md / CLAUDE.md) before getSystemPrompt()
+    // reads them. Idempotent — only loads once per session.
+    await this.warmProjectInstructions();
+
+    // Warm the skill registry — populates the manifest read by getSystemPrompt()
+    // and the cache used by the `skill` tool. Refreshed every turn so newly
+    // created/imported skills become visible without restarting the session.
+    await this.warmSkills();
+
+    // Refresh the admin-managed global prompt prefix from SharedIndex.
+    // TTL-cached on the DO so this is a no-op for most turns.
+    await this.warmGlobalPrompt();
+
+    const baseTools = this.getTools();
+    const tools = options?.tools ? { ...baseTools, ...options.tools } : baseTools;
+    const model = this.getModel();
+    const system = this.getSystemPrompt();
+    const signal = options?.signal;
+    const maxSteps = this.getMaxSteps();
+    const sessionId = this.sessionId();
+
+    // ─── Token budget thresholds ───
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+
+    // ─── Loop state ───
+    const recentToolCalls: string[] = []; // "toolName:argsJSON" for doom-loop detection
+    const recentTextPrefixes: string[] = []; // first ~80 chars of text per iteration for repetition detection
+    let cumulativeInputTokens = 0;
+    let cumulativeOutputTokens = 0;
+    let step = 0;
+    let warnInjected = false;
+    let wrapUpInjected = false;
+    let compactionTriggered = false;
+    let consecutiveNoTextSteps = 0; // Track iterations where the model produces tool calls but no text
+    let exitReason: "natural" | "step-limit" | "budget-limit" | "doom-loop" | "no-text-loop" | "text-loop" | "abort" = "natural";
+    // Running total of plain text emitted across iterations. Used after the
+    // loop to decide whether a forced final-summary turn is needed (only
+    // when the loop ended on a stuck signal and the model never wrote
+    // a real conclusion).
+    let turnText = "";
+
+    // ─── Budget thresholds (% of tokenBudget) ───
+    const WARN_THRESHOLD = 0.70;
+    const WRAP_UP_THRESHOLD = 0.85;
+    const HARD_STOP_THRESHOLD = 0.95;
+
+    // ─── Doom loop detection ───
+    const DOOM_LOOP_THRESHOLD = 3;
+    const NO_TEXT_LOOP_THRESHOLD = 15;
+    const NO_TEXT_GRACE_STEPS = 10; // Skip no-text detection for the first N steps (exploration phase)
+    // OpenAI/Google/DeepSeek models work silently (tool calls without text narration).
+    // The no-text detector is only useful for Anthropic models where silence means stuck.
+    const noTextDetectionEnabled = modelId.startsWith("anthropic/");
+    // ─── Same-tool repetition (softer than doom-loop) ───
+    // The doom-loop detector requires *identical* tool+args calls. This
+    // catches the looser pattern of "same tool name, different args, N
+    // times in a row" which is how a model gets stuck speculatively
+    // calling codemode / explore / grep without ever wrapping up.
+    // Provider-agnostic — applies to every orchestrator. Nudge first,
+    // then hard-break if the model ignores the nudge.
+    const SAME_TOOL_NUDGE_THRESHOLD = 6;
+    const SAME_TOOL_HARD_BREAK_THRESHOLD = 10;
+    let sameToolNudgeInjected = false;
+
+    // ─── Mid-loop compaction threshold ───
+    const MID_LOOP_COMPACTION_THRESHOLD = 0.50; // Compact when >50% of budget used
+
+    const self = this;
+
+    // Return a custom StreamableResult. Think's chat() calls toUIMessageStream()
+    // and iterates it, forwarding chunks via the StreamCallback.
+    return {
+      async *toUIMessageStream() {
+        // ─── Assemble context once at the start ───
+        // Think's chat() persists the assistant message only AFTER this entire
+        // generator completes. So this.messages (and thus assembleContext()) is
+        // stale during the loop — it only has messages up to the user message,
+        // not any tool calls/results from previous iterations.
+        //
+        // We assemble once, then accumulate response messages (assistant + tool
+        // results) from each streamText() call so the model sees its own
+        // previous tool results on subsequent iterations.
+        let messages = await self.assembleContext();
+
+        // ─── Capture the original user prompt for phase-transition digests ───
+        // The auto-continuation loop rebuilds `messages` on each phase with
+        // `[firstMsg, summaryInjection, ...recentMsgs]`, where `firstMsg`
+        // defaults to `messages[0]`. If the original user prompt is large
+        // (dispatch prompts often are), preserving it in full on every phase
+        // re-sends the whole prompt to the LLM each turn, inflating input
+        // tokens on every phase transition — the prompt ends up counted N
+        // times for N phases. See issue #34 comment about prompt duplication.
+        //
+        // We capture a short digest of the original prompt here so later
+        // phases can substitute the digest for `firstMsg` instead of the full
+        // prompt.
+        const originalFirstMsg = messages[0];
+        const originalPromptDigest = ((): string => {
+          if (!originalFirstMsg) return "";
+          const content = originalFirstMsg.content;
+          const text = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .map((part) => (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part ? String(part.text) : ""))
+                  .filter(Boolean)
+                  .join("\n")
+              : "";
+          // Keep the first ~500 chars — enough to carry the goal statement
+          // without dragging the whole prompt forward.
+          return text.length > 500 ? `${text.slice(0, 500)}…[truncated, see phase summary for progress]` : text;
+        })();
+
+        // ─── Loop-entry oversized-prompt guard (issue #34, bug 3) ───
+        // When the user prompt itself is large (detailed dispatch prompts, long
+        // pasted logs, etc.) the first streamText() call can exceed the budget
+        // on step 0. The own-loop assumed prompts fit and relied on turn-over-
+        // turn accumulation to trigger safeguards; that gave nothing to trip in
+        // the failure mode the autocompaction feature is designed for.
+        //
+        // If we're already past the compaction threshold before step 0, force a
+        // compaction pass, set compactionTriggered so the mid-loop check doesn't
+        // fire again unnecessarily, and re-assemble.
+        const entryInputTokens = estimateMessagesTokens(messages);
+        const entryUsage = entryInputTokens / tokenBudget;
+        if (entryUsage >= MID_LOOP_COMPACTION_THRESHOLD) {
+          compactionTriggered = true;
+          try {
+            const compactionsBefore = self.getCompactionCount();
+            await self.maybeCompactContext({ force: true });
+            const compactionsAfter = self.getCompactionCount();
+            const thinkSessionId = self.getCurrentSessionId();
+            if (thinkSessionId) {
+              self.messages = self.sessions.getHistory(thinkSessionId);
+            }
+            messages = await self.assembleContext();
+            log("info", "own-loop: loop-entry compaction attempted", {
+              sessionId,
+              entryInputTokens,
+              tokenBudget,
+              entryUsage: `${Math.round(entryUsage * 100)}%`,
+              outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
+            });
+          } catch (err) {
+            log("warn", "own-loop: loop-entry compaction failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        while (step < maxSteps) {
+          if (signal?.aborted) { exitReason = "abort"; break; }
+
+          // ─── Newline separator between iterations ───
+          // After a tool call, the model starts a new text response. Without
+          // a separator, the new text gets concatenated directly to the previous
+          // text, creating an unreadable wall of text (e.g. "Let me explore...Let me explore...").
+          // Yield a synthetic text-delta chunk so the separator flows through
+          // Think's callback and gets appended to fullText and the SSE stream.
+          if (step > 0) {
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
+          }
+
+          // ─── Between-step injections ───
+          const injections: ModelMessage[] = [];
+
+          // Doom loop detection: check if the last N tool calls are identical
+          const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2; // 5 identical calls → hard break
+          if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
+            const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
+            const allSame = lastN.every(c => c === lastN[0]);
+            if (allSame) {
+              const toolName = lastN[0].split(":")[0];
+
+              // Hard break after DOOM_LOOP_HARD_BREAK identical calls
+              if (recentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
+                const hardN = recentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
+                if (hardN.every(c => c === hardN[0])) {
+                  log("warn", "doom loop hard break — identical tool calls", {
+                    sessionId,
+                    toolName,
+                    step,
+                    repeats: DOOM_LOOP_HARD_BREAK,
+                  });
+                  yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
+                  exitReason = "doom-loop";
+                  break;
+                }
+              }
+
+              injections.push({
+                role: "system" as const,
+                content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach — use a different tool, different arguments, or explain what's blocking you.]`,
+              });
+              log("warn", "doom loop detected", {
+                sessionId,
+                toolName,
+                step,
+                repeats: DOOM_LOOP_THRESHOLD,
+              });
+            }
+          }
+
+          // ─── Same-tool repetition detection (looser than doom-loop) ───
+          // Catches the pattern where a model speculatively calls the same
+          // tool over and over with *different* args, never producing a
+          // text answer. Doom-loop misses this because each call's args
+          // differ. The harness intervenes in two stages:
+          //   1. Nudge at SAME_TOOL_NUDGE_THRESHOLD (default 6) — inject
+          //      a system message asking the model whether it's done.
+          //   2. Hard-break at SAME_TOOL_HARD_BREAK_THRESHOLD (default 10) —
+          //      if the model ignored the nudge and kept calling the same
+          //      tool, we exit cleanly with a wrap-up message.
+          // Provider-agnostic — applies to every orchestrator regardless
+          // of whether silent tool-calling is normal for the provider.
+          // First observed on Gemma 4 26B running 18 consecutive codemode
+          // calls without ever writing a conclusion.
+          const hardBreakTool = detectSameToolRepetition(
+            recentToolCalls,
+            SAME_TOOL_HARD_BREAK_THRESHOLD,
+          );
+          if (hardBreakTool) {
+            log("warn", "same-tool repetition hard break", {
+              sessionId,
+              toolName: hardBreakTool,
+              step,
+              repeats: SAME_TOOL_HARD_BREAK_THRESHOLD,
+            });
+            yield {
+              type: "text-delta",
+              id: crypto.randomUUID(),
+              delta: `\n\n[Stopped: ${hardBreakTool} called ${SAME_TOOL_HARD_BREAK_THRESHOLD} times in a row without producing a text answer — write your conclusion from what you have so far.]\n\n`,
+            };
+            exitReason = "doom-loop";
+            break;
+          }
+          const nudgeTool = detectSameToolRepetition(
+            recentToolCalls,
+            SAME_TOOL_NUDGE_THRESHOLD,
+          );
+          if (nudgeTool && !sameToolNudgeInjected) {
+            sameToolNudgeInjected = true;
+            injections.push({
+              role: "system" as const,
+              content: `[STOP-CHECK] You've called \`${nudgeTool}\` ${SAME_TOOL_NUDGE_THRESHOLD} times in a row. Do you have enough information to answer the user? If yes: write your conclusion as plain text and do NOT call any more tools. If no: switch to a different tool or explain what's missing. Do not call \`${nudgeTool}\` again unless you have a concrete new question that requires it.`,
+            });
+            log("info", "same-tool repetition nudge injected", {
+              sessionId,
+              toolName: nudgeTool,
+              step,
+              repeats: SAME_TOOL_NUDGE_THRESHOLD,
+            });
+          }
+
+          // ─── Cost runaway backstop ───
+          // Per-call context pressure (below) is the primary stop signal,
+          // but a model stuck in a non-doom-loop loop (tools succeeding,
+          // results changing, but no real progress) could still burn
+          // unbounded tokens. Cap absolute cumulative input at 5× the
+          // context budget. For a 200k-context model that's 1M tokens —
+          // generous for real work, low enough to catch obvious runaway.
+          const COST_RUNAWAY_FACTOR = 5;
+          if (cumulativeInputTokens >= tokenBudget * COST_RUNAWAY_FACTOR) {
+            log("warn", "own-loop: cost runaway backstop", {
+              sessionId,
+              step,
+              cumulativeInputTokens,
+              tokenBudget,
+              factor: COST_RUNAWAY_FACTOR,
+            });
+            yield {
+              type: "text-delta",
+              id: crypto.randomUUID(),
+              delta: `\n\n[Stopped: cumulative input tokens exceeded ${COST_RUNAWAY_FACTOR}× the context budget — likely loop]\n\n`,
+            };
+            exitReason = "budget-limit";
+            break;
+          }
+
+          // ─── Budget-aware injections (context pressure, not cumulative cost) ───
+          //
+          // The thresholds below tell the model when it's running out of
+          // **context window space**, not when it's spent a lot of tokens.
+          // These are different: cumulative input grows by ~system-prompt
+          // size every step regardless of how much real history the model
+          // is carrying, so gating on cumulative tells the model to bail
+          // when its actual context window has plenty of room.
+          //
+          // We estimate the size of the message array we'd send NEXT to
+          // streamText (system prompt + tools are added by the SDK on top;
+          // this only measures the messages-array portion). That's the
+          // signal that matches what the wrap-up text actually says
+          // ("nearly exhausted... do not read new files").
+          //
+          // `cumulativeInputTokens` is kept for telemetry — logged on every
+          // step-complete line — but no longer gates injections. We
+          // discovered the previous coupling by deploying #75 + #76 and
+          // watching Gemma get told to stop at step 8 of a session where
+          // projected context was at 10%. See PR #77.
+          const projectedNextCallTokens = estimateMessagesTokens(messages);
+          const budgetUsage = projectedNextCallTokens / tokenBudget;
+
+          if (budgetUsage >= HARD_STOP_THRESHOLD) {
+            log("warn", "own-loop: hard stop — projected context budget exhausted", {
+              sessionId,
+              step,
+              projectedNextCallTokens,
+              cumulativeInputTokens,
+              tokenBudget,
+              usage: `${Math.round(budgetUsage * 100)}%`,
+            });
+            exitReason = "budget-limit";
+            break;
+          }
+
+          if (budgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
+            injections.push({
+              role: "system" as const,
+              content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
+            });
+            wrapUpInjected = true;
+            log("info", "own-loop: wrap-up injection", {
+              sessionId,
+              step,
+              projectedNextCallTokens,
+              cumulativeInputTokens,
+              tokenBudget,
+              usage: `${Math.round(budgetUsage * 100)}%`,
+            });
+          } else if (budgetUsage >= WARN_THRESHOLD && !warnInjected) {
+            injections.push({
+              role: "system" as const,
+              content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
+            });
+            warnInjected = true;
+            log("info", "own-loop: budget warning injection", {
+              sessionId,
+              step,
+              projectedNextCallTokens,
+              cumulativeInputTokens,
+              tokenBudget,
+              usage: `${Math.round(budgetUsage * 100)}%`,
+            });
+          }
+
+          // ─── Mid-loop compaction ───
+          // If context usage is above threshold and we haven't compacted yet this turn,
+          // trigger Think's compaction system to summarize older messages.
+          // After compaction, re-assemble the local messages array so it
+          // picks up the compacted history (with the summary injected).
+          //
+          // No `step >= N` guard: a large prompt + aggressive exploration can burn
+          // through the budget in steps 0-2. The `!compactionTriggered` flag already
+          // prevents compaction from firing more than once per turn, so gating on
+          // step count only delays a necessary safety net. See issue #34.
+          if (budgetUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
+            compactionTriggered = true;
+            try {
+              // force=true so maybeCompactContext() bypasses the
+              // `lastInputTokens === 0` early-return guard. The mid-loop
+              // trigger fires on the FIRST user turn (before any assistant
+              // message is persisted), so lastInputTokens is always 0 here
+              // and the guard would silently no-op without `force`. The
+              // own-loop has already proved compaction is warranted by
+              // measuring cumulativeInputTokens directly — don't make
+              // maybeCompactContext re-decide.
+              const compactionsBefore = self.getCompactionCount();
+              await self.maybeCompactContext({ force: true });
+              const compactionsAfter = self.getCompactionCount();
+              // Refresh messages from storage and re-assemble with compaction summary.
+              const thinkSessionId = self.getCurrentSessionId();
+              if (thinkSessionId) {
+                self.messages = self.sessions.getHistory(thinkSessionId);
+              }
+              messages = await self.assembleContext();
+              // Log the outcome truthfully — distinguishes "we attempted and
+              // it summarised something" from "we attempted but it no-op'd
+              // because there's nothing in Think's persisted history yet."
+              // Without the distinction, debugging compaction issues is a
+              // wild goose chase (we hit that twice already — see PR #74).
+              log("info", "own-loop: mid-loop compaction attempted", {
+                sessionId,
+                step,
+                cumulativeInputTokens,
+                tokenBudget,
+                outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
+              });
+            } catch (err) {
+              log("warn", "own-loop: mid-loop compaction failed", {
+                sessionId,
+                step,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          // Build final messages with injections appended
+          let finalMessages = injections.length > 0
+            ? [...messages, ...injections]
+            : messages;
+
+          // ─── Pre-step budget check (issue #34, bug 2) ───
+          // cumulativeInputTokens is only updated AFTER streamText() completes,
+          // so the budget-aware injections above (warn / wrap-up / hard-stop) see
+          // counters that trail the just-finished step. If a single step burns
+          // through the budget, the next step's pre-call injection won't fire in
+          // time. Estimate the input size directly from the outgoing messages and
+          // force compaction before making the LLM call if we're already past the
+          // compaction threshold.
+          const projectedInputTokens = estimateMessagesTokens(finalMessages);
+          const projectedUsage = projectedInputTokens / tokenBudget;
+
+          if (projectedUsage >= MID_LOOP_COMPACTION_THRESHOLD && !compactionTriggered) {
+            compactionTriggered = true;
+            try {
+              const compactionsBefore = self.getCompactionCount();
+              await self.maybeCompactContext({ force: true });
+              const compactionsAfter = self.getCompactionCount();
+              const thinkSessionId = self.getCurrentSessionId();
+              if (thinkSessionId) {
+                self.messages = self.sessions.getHistory(thinkSessionId);
+              }
+              messages = await self.assembleContext();
+              finalMessages = injections.length > 0
+                ? [...messages, ...injections]
+                : messages;
+              log("info", "own-loop: pre-step compaction attempted", {
+                sessionId,
+                step,
+                projectedInputTokens,
+                tokenBudget,
+                projectedUsage: `${Math.round(projectedUsage * 100)}%`,
+                outcome: compactionsAfter > compactionsBefore ? "summarised" : "noop",
+              });
+            } catch (err) {
+              log("warn", "own-loop: pre-step compaction failed", {
+                sessionId,
+                step,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          // ─── In-memory tool-result prune (harness safety net) ───
+          // Think-level compaction operates on persisted session history.
+          // On the very first user turn that's just `[user]`, so compaction
+          // had nothing to summarise and left `finalMessages` untouched.
+          // For weak orchestrators that fan out many tool calls inside a
+          // single turn, this is the failure mode that ends sessions
+          // prematurely with "context budget exhausted".
+          //
+          // This is a no-LLM, no-storage fallback: walk `finalMessages`
+          // and shorten the largest tool-result payloads (oldest first,
+          // preserving the most recent two) until projected tokens are
+          // back under the mid-loop threshold. Preserves the tool-call
+          // envelope (toolName, toolCallId) so the model's chain of
+          // pending tool calls still resolves.
+          //
+          // **Trigger condition.** Two signals can independently warrant
+          // a prune:
+          //  1. `projectedInputTokens` — what we're about to send to
+          //     streamText on this iteration. Useful when the current
+          //     iteration's payload is already huge.
+          //  2. `cumulativeInputTokens` — what we've sent across ALL
+          //     iterations of this turn so far. Useful when the cumulative
+          //     climb is the problem even though any single iteration
+          //     looks small.
+          //
+          // Without #2 the prune never fires for the typical Gemma
+          // failure: each per-step call sends ~19k tokens (system prompt
+          // + tool defs dominate) so the per-iteration projection stays
+          // small, but the running total burns through the budget. We
+          // saw this empirically: 8 successful steps, cumulative 158k
+          // (77%), zero prune log lines.
+          const projectedAfterCompactionTokens = estimateMessagesTokens(finalMessages);
+          const projectedTrigger =
+            projectedAfterCompactionTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD;
+          const cumulativeTrigger =
+            cumulativeInputTokens / tokenBudget >= MID_LOOP_COMPACTION_THRESHOLD;
+          if (projectedTrigger || cumulativeTrigger) {
+            const pruneResult = pruneOversizedToolResults(finalMessages, {
+              targetTokens: Math.floor(tokenBudget * MID_LOOP_COMPACTION_THRESHOLD),
+              estimate: estimateMessagesTokens,
+            });
+            if (pruneResult.pruned) {
+              log("info", "own-loop: in-memory tool-result prune", {
+                sessionId,
+                step,
+                partsPruned: pruneResult.partsPruned,
+                bytesRemoved: pruneResult.bytesRemoved,
+                tokensBefore: pruneResult.tokensBefore,
+                tokensAfter: pruneResult.tokensAfter,
+                trigger: cumulativeTrigger ? "cumulative" : "projected",
+              });
+            }
+          }
+
+          // Hard stop if even after compaction + prune we're projected above the budget.
+          // Without this, streamText() is guaranteed to throw a context-overflow
+          // error — better to exit cleanly with a wrap-up message.
+          const projectedAfterPruneTokens = estimateMessagesTokens(finalMessages);
+          const projectedAfterUsage = projectedAfterPruneTokens / tokenBudget;
+          if (projectedAfterUsage >= HARD_STOP_THRESHOLD) {
+            log("warn", "own-loop: pre-step hard stop — projected tokens exceed budget", {
+              sessionId,
+              step,
+              projectedInputTokens: projectedAfterPruneTokens,
+              tokenBudget,
+              projectedUsage: `${Math.round(projectedAfterUsage * 100)}%`,
+            });
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Stopped: context budget exhausted before next step]\n\n" };
+            exitReason = "budget-limit";
+            break;
+          }
+
+          // ─── Single-step LLM call with overflow recovery (Tactic 5) ───
+          // Note: Prompt cache retention (Tactic 7) requires the native @ai-sdk/anthropic
+          // provider. Dodo uses @ai-sdk/openai-compatible which doesn't support
+          // Anthropic-specific providerOptions. Cache control will be enabled when/if
+          // we switch to the native Anthropic provider.
+          let result;
+          // Declared outside try so post-step bookkeeping can access them
+          let iterationText = "";
+          let chunkCount = 0;
+          let hasErrorChunk = false;
+          let errorText = "";
+          try {
+            result = streamText({
+              model,
+              system,
+              messages: finalMessages,
+              tools,
+              abortSignal: signal,
+            });
+
+            // Forward all chunks from this iteration to the caller.
+            // Capture text emitted this iteration for repetition detection.
+            for await (const chunk of result.toUIMessageStream()) {
+              yield chunk;
+              chunkCount++;
+              const c = chunk as { type?: string; delta?: string; errorText?: string; error?: string };
+              if (c.type === "text-delta" && c.delta) {
+                iterationText += c.delta;
+                turnText += c.delta;
+              } else if (c.type === "error") {
+                hasErrorChunk = true;
+                errorText = c.errorText ?? c.error ?? "unknown";
+              }
+            }
+
+            // Log diagnostic info when the stream produced no content
+            if (!iterationText && chunkCount === 0) {
+              log("warn", "own-loop: LLM stream produced zero chunks", {
+                sessionId,
+                step,
+                model: modelId,
+              });
+            } else if (hasErrorChunk) {
+              log("warn", "own-loop: LLM stream contained error chunk", {
+                sessionId,
+                step,
+                model: modelId,
+                errorText: errorText.slice(0, 500),
+                chunkCount,
+              });
+              if (!iterationText && errorText) {
+                throw new Error(errorText);
+              }
+            }
+          } catch (err) {
+            // ─── Overflow recovery ───
+            // Detect context overflow errors and trigger emergency compaction.
+            // Only attempt once per onChatMessage() invocation to prevent infinite loops.
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const decision = nextRetry({
+              previousAttempts: self._overflowRecoveryAttempted ? 1 : 0,
+              maxAttempts: 1,
+              error: { message: errMsg },
+            });
+
+            if (decision.kind === "retry-with-truncation") {
+              self._overflowRecoveryAttempted = true;
+              log("warn", "own-loop: context overflow detected, attempting emergency compaction", {
+                sessionId,
+                step,
+                error: errMsg.slice(0, 200),
+              });
+
+              try {
+                await self.maybeCompactContext({ force: true });
+                // Refresh messages from storage so we get the compaction summary.
+                const thinkSid = self.getCurrentSessionId();
+                if (thinkSid) {
+                  self.messages = self.sessions.getHistory(thinkSid);
+                }
+                // Re-assemble context after compaction to pick up the summary.
+                // This replaces the stale accumulated messages with freshly
+                // compacted ones.
+                messages = await self.assembleContext();
+                step++;
+                continue;
+              } catch (compactionErr) {
+                log("warn", "own-loop: emergency compaction failed, propagating original error", {
+                  sessionId,
+                  error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
+                });
+              }
+            }
+            // Re-throw if not an overflow or recovery failed
+            throw err;
+          }
+
+          // ─── Post-step bookkeeping ───
+          // Reset overflow recovery flag on successful step
+          self._overflowRecoveryAttempted = false;
+
+          const usage = await (result as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
+          cumulativeInputTokens += usage?.inputTokens ?? 0;
+          cumulativeOutputTokens += usage?.outputTokens ?? 0;
+
+          // ─── Accumulate response messages for the next iteration ───
+          // streamText() returns response messages (assistant + tool results)
+          // that must be appended to the messages array so the model sees its
+          // own tool call results on subsequent iterations. Without this, each
+          // iteration would only see the original user message (because
+          // this.messages is not updated until Think's chat() finishes).
+          const response = await (result as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
+          if (response?.messages?.length) {
+            messages = [...messages, ...response.messages];
+          }
+
+          // Track tool calls for doom loop detection
+          const steps = await (result as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
+          const lastStep = steps?.[steps.length - 1];
+          if (lastStep?.toolCalls?.length) {
+            for (const tc of lastStep.toolCalls) {
+              recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
+            }
+            // Keep enough history to feed all the loop detectors that
+            // read from this buffer: the doom-loop check needs the last
+            // DOOM_LOOP_THRESHOLD * 2 entries; the same-tool hard-break
+            // check needs the last SAME_TOOL_HARD_BREAK_THRESHOLD. Pick
+            // the larger so neither detector starves.
+            const recentToolCallsRetention = Math.max(
+              DOOM_LOOP_THRESHOLD * 2,
+              SAME_TOOL_HARD_BREAK_THRESHOLD,
+            );
+            if (recentToolCalls.length > recentToolCallsRetention) {
+              recentToolCalls.splice(0, recentToolCalls.length - recentToolCallsRetention);
+            }
+          }
+
+          // ─── Text repetition detection ───
+          // Catches loops where the model emits similar text each iteration
+          // but varies tool arguments (evading the tool-call doom loop detector).
+          // Compare the first ~80 chars of text from each iteration.
+          const textPrefix = iterationText.trim().slice(0, 80);
+          if (textPrefix.length > 10) {
+            recentTextPrefixes.push(textPrefix);
+            if (recentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
+              recentTextPrefixes.splice(0, recentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
+            }
+            if (recentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
+              const lastN = recentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
+              const allSame = lastN.every(t => t === lastN[0]);
+              if (allSame) {
+                log("warn", "text repetition loop detected — breaking", {
+                  sessionId,
+                  step,
+                  repeatedText: textPrefix.slice(0, 60),
+                  repeats: DOOM_LOOP_THRESHOLD,
+                });
+                exitReason = "text-loop";
+                break;
+              }
+            }
+          }
+
+          // ─── No-text tool-call loop detection ───
+          // Catches loops where the model makes diverse tool calls (evading the
+          // identical-call detector) and produces no meaningful text (evading the
+          // text-repetition detector). If the model makes tool calls without any
+          // text for too many consecutive iterations, it's stuck exploring.
+          if (noTextDetectionEnabled && textPrefix.length <= 10 && lastStep?.toolCalls?.length) {
+            consecutiveNoTextSteps++;
+            if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+              log("warn", "no-text tool-call loop detected — breaking", {
+                sessionId,
+                step,
+                consecutiveNoTextSteps,
+                recentTools: recentToolCalls.slice(-NO_TEXT_LOOP_THRESHOLD),
+              });
+              // Inject a final message asking the model to summarize
+              yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
+              exitReason = "no-text-loop";
+              break;
+            }
+          } else {
+            consecutiveNoTextSteps = 0;
+          }
+
+          // Check finish reason — if the model didn't make a tool call, it's done
+          const finishReason = await (result as unknown as { finishReason: PromiseLike<string> }).finishReason;
+
+          log("info", "own-loop: step complete", {
+            sessionId,
+            step,
+            finishReason,
+            inputTokens: usage?.inputTokens ?? 0,
+            cumulativeInputTokens,
+            budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+            toolCalls: lastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
+            consecutiveNoTextSteps,
+          });
+
+          if (finishReason !== "tool-calls") break;
+
+          step++;
+        }
+
+        // Tag step-limit exit (while condition failed)
+        if (step >= maxSteps && exitReason === "natural") {
+          exitReason = "step-limit";
+        }
+
+        // ─── Final-summary turn (after a stuck-loop exit) ───
+        //
+        // When the loop exits on a stuck signal (doom-loop, no-text-loop,
+        // text-loop, or budget hard-stop without auto-continuation),
+        // the model often left only the harness's own
+        // "[Stopped: ...]" delta in the user-visible response — no real
+        // conclusion. The auto-continuation block below SKIPS those exits
+        // by design (they mean the model is stuck and shouldn't be
+        // restarted). But it leaves users with a stop notice and no
+        // answer.
+        //
+        // Run one more single-turn streamText with NO tools and a
+        // strict 'write your conclusion now' system message. The model
+        // has no choice but to emit text. Bounded by a short timeout
+        // so this can't itself loop.
+        //
+        // Guards:
+        //   - skipped on abort (the user asked to stop)
+        //   - skipped on `natural` exit (the model already wrapped up)
+        //   - skipped when the turn already produced substantive text
+        //     (>=200 chars of non-stop-notice content)
+        //   - skipped on cost-runaway exits where there's no point
+        //     spending more tokens
+        const FINAL_SUMMARY_MIN_EXISTING_TEXT = 200;
+        const FINAL_SUMMARY_TIMEOUT_MS = 30_000;
+        const FINAL_SUMMARY_MAX_OUTPUT_TOKENS = 800;
+
+        const turnTextWithoutHarnessNotices = stripHarnessNotices(turnText);
+        const runFinalSummary = shouldRunFinalSummary({
+          exitReason,
+          signalAborted: !!signal?.aborted,
+          turnText,
+          minExistingTextChars: FINAL_SUMMARY_MIN_EXISTING_TEXT,
+        });
+
+        if (runFinalSummary) {
+          log("info", "own-loop: final-summary turn starting", {
+            sessionId,
+            exitReason,
+            existingTextChars: turnTextWithoutHarnessNotices.length,
+            step,
+          });
+
+          // Pure-text system injection appended to the existing messages.
+          // No tools handed to the model — it cannot make another tool
+          // call, only write text. This is the whole point.
+          const summaryInjection: ModelMessage = {
+            role: "system" as const,
+            content: [
+              "[FINAL TURN — NO TOOLS AVAILABLE]",
+              "The session has been stopped by the harness because " +
+                (exitReason === "doom-loop"
+                  ? "you called the same tool too many times in a row"
+                  : exitReason === "no-text-loop"
+                  ? "you made many tool calls without writing any text"
+                  : "your responses started repeating") +
+                ".",
+              "Write your final answer to the user now. Summarise:",
+              "  1. What you were trying to do.",
+              "  2. What you actually found out (the useful information from your tool calls).",
+              "  3. What you would have done next if you'd had more turns.",
+              "Do NOT apologise, do NOT explain that you stopped — the user already knows. Just give the conclusion.",
+            ].join("\n"),
+          };
+
+          const summaryMessages = [...messages, summaryInjection];
+
+          // Bound this turn with a fresh AbortController chained to the
+          // outer signal, so a timeout here doesn't leak the outer
+          // controller. We can't directly time-bound streamText, but
+          // we can race its iterator against a timer.
+          const summaryController = new AbortController();
+          const onOuterAbort = () => summaryController.abort();
+          signal?.addEventListener("abort", onOuterAbort, { once: true });
+          const timeoutHandle = setTimeout(() => {
+            summaryController.abort();
+            log("warn", "own-loop: final-summary turn timed out", {
+              sessionId,
+              timeoutMs: FINAL_SUMMARY_TIMEOUT_MS,
+            });
+          }, FINAL_SUMMARY_TIMEOUT_MS);
+
+          try {
+            const summaryResult = streamText({
+              model,
+              system,
+              messages: summaryMessages,
+              tools: {}, // No tools — the model must write text.
+              maxOutputTokens: FINAL_SUMMARY_MAX_OUTPUT_TOKENS,
+              abortSignal: summaryController.signal,
+            });
+            // Separator so the conclusion is visibly distinct from
+            // any harness stop notice that came before it.
+            yield {
+              type: "text-delta",
+              id: crypto.randomUUID(),
+              delta: "\n\n---\n\n",
+            };
+            for await (const chunk of summaryResult.toUIMessageStream()) {
+              yield chunk;
+            }
+            log("info", "own-loop: final-summary turn complete", {
+              sessionId,
+              exitReason,
+            });
+          } catch (err) {
+            log("warn", "own-loop: final-summary turn failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            // Non-fatal — the stop notice already in `turnText` is the
+            // user-visible result; we tried for more and failed.
+          } finally {
+            clearTimeout(timeoutHandle);
+            signal?.removeEventListener("abort", onOuterAbort);
+          }
+        }
+
+        // ─── Multi-phase auto-continuation ───
+        // When the loop ends due to resource limits (step or budget), truncate
+        // context in-memory and start a new phase. Repeats up to MAX_PHASES
+        // times. Does NOT trigger on loop detection exits (doom loop, text
+        // repetition, no-text loop) — those indicate the model is stuck.
+        const MAX_CONTINUATION_PHASES = 5;
+        let totalInputTokens = cumulativeInputTokens;
+        let totalOutputTokens = cumulativeOutputTokens;
+
+        for (let phase = 1; phase <= MAX_CONTINUATION_PHASES; phase++) {
+          const shouldAutoContinue = (exitReason === "step-limit" || exitReason === "budget-limit");
+          if (!shouldAutoContinue || signal?.aborted) break;
+
+          const phaseNum = phase + 1; // phase 1 = original, phase 2+ = continuations
+          log("info", `own-loop: auto-continuation phase ${phaseNum}`, {
+            sessionId,
+            step,
+            exitReason,
+            budgetUsage: `${Math.round((totalInputTokens / tokenBudget) * 100)}%`,
+          });
+
+          yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Compacting context and continuing... (phase ${phaseNum})]\n\n` };
+
+          try {
+            // ─── In-memory context truncation ───
+            // Keep more recent messages (12) so the model retains context
+            // from the current phase. Also extract text output from dropped
+            // messages to preserve the model's findings and plan.
+            const keepRecent = 12;
+            if (messages.length > keepRecent + 2) {
+              // Replace the original (potentially huge) user prompt at index 0
+              // with a compact synthetic system message that carries only the
+              // goal digest. See issue #34 — re-sending the full prompt on
+              // every phase duplicated input-token cost N times for N phases.
+              const firstMsg: ModelMessage = originalPromptDigest
+                ? {
+                    role: "system" as const,
+                    content: `[Original task]\n${originalPromptDigest}`,
+                  }
+                : messages[0];
+              const recentMsgs = messages.slice(-keepRecent);
+              const droppedMsgs = messages.slice(1, -keepRecent);
+
+              const droppedCount = droppedMsgs.length;
+              const droppedToolNames = new Set<string>();
+              const discoveredFiles = new Set<string>();
+              const assistantTexts: string[] = [];
+              // Compact record of each dropped tool call: `name(sanitized-args)`.
+              // Previously we only preserved distinct tool *names* plus any
+              // `input.path`, which meant after compaction the model lost
+              // specifics like 'git_clone was called with {url, depth: 30,
+              // dir: /dodo}' and just saw 'git_clone was used'. It then
+              // re-cloned. This cost us ~200k tokens across phases in the
+              // repeatable session-6d85ea02 / 1243c636 failure. Capping each
+              // entry at 160 chars and the whole list at 2 KB keeps the
+              // digest small even for 30+ tool calls.
+              const toolCallDigest: string[] = [];
+              const MAX_TOOL_CALL_ENTRY_CHARS = 160;
+              const MAX_TOOL_CALL_DIGEST_CHARS = 2_000;
+
+              for (const msg of droppedMsgs) {
+                if (typeof msg.content === "object" && Array.isArray(msg.content)) {
+                  for (const part of msg.content) {
+                    if (part && typeof part === "object" && "type" in part) {
+                      if (part.type === "tool-call" && "toolName" in part) {
+                        const toolName = String(part.toolName);
+                        droppedToolNames.add(toolName);
+                        if ("input" in part && part.input && typeof part.input === "object") {
+                          const input = part.input as Record<string, unknown>;
+                          if (typeof input.path === "string" && input.path.length > 1) {
+                            discoveredFiles.add(input.path);
+                          }
+                          // Sanitize + cap the input for the tool-call digest.
+                          // Strip long string fields (content / code / old_string /
+                          // new_string) before serializing so a single write
+                          // doesn't eat the whole budget.
+                          const sanitized: Record<string, unknown> = {};
+                          for (const [k, v] of Object.entries(input)) {
+                            if (typeof v === "string" && v.length > 80) {
+                              sanitized[k] = `<${v.length}-char ${k}>`;
+                            } else {
+                              sanitized[k] = v;
+                            }
+                          }
+                          let entry = `${toolName}(${JSON.stringify(sanitized)})`;
+                          if (entry.length > MAX_TOOL_CALL_ENTRY_CHARS) {
+                            entry = entry.slice(0, MAX_TOOL_CALL_ENTRY_CHARS - 3) + "...";
+                          }
+                          toolCallDigest.push(entry);
+                        } else {
+                          toolCallDigest.push(`${toolName}()`);
+                        }
+                      }
+                      // Extract the model's text output (findings, plans, decisions)
+                      if (part.type === "text" && "text" in part && typeof part.text === "string") {
+                        const text = part.text.trim();
+                        if (text.length > 20) assistantTexts.push(text);
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Tail-trim tool-call digest so the most recent calls survive.
+              // Older calls are less relevant — the model has likely acted on them.
+              let toolCallList = toolCallDigest.join("\n");
+              if (toolCallList.length > MAX_TOOL_CALL_DIGEST_CHARS) {
+                let bytes = 0;
+                const kept: string[] = [];
+                for (let i = toolCallDigest.length - 1; i >= 0; i--) {
+                  const entry = toolCallDigest[i];
+                  if (bytes + entry.length + 1 > MAX_TOOL_CALL_DIGEST_CHARS) break;
+                  kept.unshift(entry);
+                  bytes += entry.length + 1;
+                }
+                toolCallList = `[...older tool calls elided...]\n${kept.join("\n")}`;
+              }
+
+              // Build a summary that preserves the model's key findings
+              const toolsSummary = [...droppedToolNames].join(", ") || "none";
+              const filesList = discoveredFiles.size > 0
+                ? "\n\nFiles discovered in previous phases:\n" + [...discoveredFiles].join("\n")
+                : "";
+              const callsList = toolCallList.length > 0
+                ? "\n\nTool calls already made in previous phases (DO NOT repeat these):\n" + toolCallList
+                : "";
+              const findingsDigest = assistantTexts.length > 0
+                ? "\n\nKey findings from previous phases:\n" + assistantTexts.join("\n").slice(-1500)
+                : "";
+
+              const summaryInjection: ModelMessage = {
+                role: "system" as const,
+                content: `[Previous context truncated — ${droppedCount} messages dropped. Tools used: ${toolsSummary}. The task is not yet complete. Do NOT re-explore files you already found and do NOT repeat tool calls already made — use the file paths, tool-call history, and findings below to continue making edits.${callsList}${filesList}${findingsDigest}]`,
+              };
+
+              messages = [firstMsg, summaryInjection, ...recentMsgs];
+              log("info", `own-loop: phase ${phaseNum} context truncation`, {
+                sessionId,
+                originalCount: messages.length + droppedCount,
+                keptCount: messages.length,
+                droppedTools: [...droppedToolNames],
+                droppedToolCalls: toolCallDigest.length,
+                discoveredFiles: discoveredFiles.size,
+                findingsLength: findingsDigest.length,
+                toolCallDigestLength: toolCallList.length,
+              });
+            }
+
+            // Reset budget tracking for the new phase
+            cumulativeInputTokens = 0;
+            cumulativeOutputTokens = 0;
+            warnInjected = false;
+            wrapUpInjected = false;
+            compactionTriggered = false;
+            consecutiveNoTextSteps = 0;
+            recentToolCalls.length = 0;
+            recentTextPrefixes.length = 0;
+            exitReason = "natural";
+
+            // Inject continuation prompt — directive to avoid re-exploration
+            const continuationInjection: ModelMessage = {
+              role: "user" as const,
+              content: "[auto-continue] Your previous turn was cut short by context limits. The conversation has been compacted. Do NOT re-explore the codebase — your findings are preserved in the summary above. Start making edits immediately using the file paths and line numbers from the summary and recent context.",
+            };
+            messages = [...messages, continuationInjection];
+
+            // Run the next phase
+            step = 0;
+            while (step < maxSteps) {
+              if (signal?.aborted) { exitReason = "abort"; break; }
+
+              if (step > 0) {
+                yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n" };
+              }
+
+              const phaseInjections: ModelMessage[] = [];
+              const phaseBudgetUsage = cumulativeInputTokens / tokenBudget;
+
+              if (phaseBudgetUsage >= HARD_STOP_THRESHOLD) {
+                log("warn", `own-loop: phase ${phase + 1} hard stop`, { sessionId, step });
+                exitReason = "budget-limit";
+                break;
+              }
+              if (phaseBudgetUsage >= WRAP_UP_THRESHOLD && !wrapUpInjected) {
+                phaseInjections.push({
+                  role: "system" as const,
+                  content: "[CONTEXT BUDGET NEARLY EXHAUSTED] Summarize what you've done and what remains, then stop. Do not read new files or start new tasks. Complete your current thought and wrap up.",
+                });
+                wrapUpInjected = true;
+              } else if (phaseBudgetUsage >= WARN_THRESHOLD && !warnInjected) {
+                phaseInjections.push({
+                  role: "system" as const,
+                  content: "[CONTEXT BUDGET WARNING] You are using most of your context budget. Focus on completing the current task. Avoid reading new files unless essential. Prefer targeted edits over full file reads.",
+                });
+                warnInjected = true;
+              }
+
+              // Doom loop detection (two-tier: soft warning then hard break)
+              if (recentToolCalls.length >= DOOM_LOOP_THRESHOLD) {
+                const lastN = recentToolCalls.slice(-DOOM_LOOP_THRESHOLD);
+                if (lastN.every(c => c === lastN[0])) {
+                  const toolName = lastN[0].split(":")[0];
+                  const DOOM_LOOP_HARD_BREAK = DOOM_LOOP_THRESHOLD + 2;
+
+                  if (recentToolCalls.length >= DOOM_LOOP_HARD_BREAK) {
+                    const hardN = recentToolCalls.slice(-DOOM_LOOP_HARD_BREAK);
+                    if (hardN.every(c => c === hardN[0])) {
+                      log("warn", `own-loop: phase ${phase + 1} doom loop hard break`, { sessionId, step, toolName });
+                      yield { type: "text-delta", id: crypto.randomUUID(), delta: `\n\n[Stopped: repeated ${toolName} calls detected]\n\n` };
+                      exitReason = "doom-loop";
+                      break;
+                    }
+                  }
+
+                  phaseInjections.push({
+                    role: "system" as const,
+                    content: `[WARNING: You have called ${toolName} with the same arguments ${DOOM_LOOP_THRESHOLD} times in a row. This is a loop. Try a different approach.]`,
+                  });
+                }
+              }
+
+              const finalMessages = phaseInjections.length > 0
+                ? [...messages, ...phaseInjections]
+                : messages;
+
+              let phResult;
+              let phText = "";
+              try {
+                phResult = streamText({
+                  model,
+                  system,
+                  messages: finalMessages,
+                  tools,
+                  abortSignal: signal,
+                });
+
+                for await (const chunk of phResult.toUIMessageStream()) {
+                  yield chunk;
+                  const c = chunk as { type?: string; delta?: string };
+                  if (c.type === "text-delta" && c.delta) {
+                    phText += c.delta;
+                  }
+                }
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                const isOverflow = /context.*(length|limit|overflow|window|too long|exceed)/i.test(errMsg)
+                  || /max.*token/i.test(errMsg)
+                  || /request too large/i.test(errMsg);
+                if (isOverflow) {
+                  log("warn", `own-loop: phase ${phase + 1} overflow — stopping`, { sessionId });
+                  exitReason = "budget-limit";
+                  break;
+                }
+                throw err;
+              }
+
+              const phUsage = await (phResult as unknown as { totalUsage: PromiseLike<{ inputTokens?: number; outputTokens?: number }> }).totalUsage;
+              cumulativeInputTokens += phUsage?.inputTokens ?? 0;
+              cumulativeOutputTokens += phUsage?.outputTokens ?? 0;
+
+              const phResponse = await (phResult as unknown as { response: PromiseLike<{ messages: ModelMessage[] }> }).response;
+              if (phResponse?.messages?.length) {
+                messages = [...messages, ...phResponse.messages];
+              }
+
+              // Track tool calls for loop detection
+              const phSteps = await (phResult as unknown as { steps: PromiseLike<Array<{ toolCalls?: Array<{ toolName: string; input: unknown }> }>> }).steps;
+              const phLastStep = phSteps?.[phSteps.length - 1];
+              if (phLastStep?.toolCalls?.length) {
+                for (const tc of phLastStep.toolCalls) {
+                  recentToolCalls.push(`${tc.toolName}:${JSON.stringify(tc.input)}`);
+                }
+                if (recentToolCalls.length > DOOM_LOOP_THRESHOLD * 2) {
+                  recentToolCalls.splice(0, recentToolCalls.length - DOOM_LOOP_THRESHOLD * 2);
+                }
+              }
+
+              // Text repetition detection
+              const phTextPrefix = phText.trim().slice(0, 80);
+              if (phTextPrefix.length > 10) {
+                recentTextPrefixes.push(phTextPrefix);
+                if (recentTextPrefixes.length > DOOM_LOOP_THRESHOLD * 2) {
+                  recentTextPrefixes.splice(0, recentTextPrefixes.length - DOOM_LOOP_THRESHOLD * 2);
+                }
+                if (recentTextPrefixes.length >= DOOM_LOOP_THRESHOLD) {
+                  const lastN = recentTextPrefixes.slice(-DOOM_LOOP_THRESHOLD);
+                  if (lastN.every(t => t === lastN[0])) {
+                    log("warn", `own-loop: phase ${phase + 1} text repetition loop`, { sessionId, step });
+                    exitReason = "text-loop";
+                    break;
+                  }
+                }
+              }
+
+              // No-text loop detection (only for Anthropic; OpenAI/Google work silently)
+              if (noTextDetectionEnabled && phTextPrefix.length <= 10 && phLastStep?.toolCalls?.length) {
+                consecutiveNoTextSteps++;
+                if (step >= NO_TEXT_GRACE_STEPS && consecutiveNoTextSteps >= NO_TEXT_LOOP_THRESHOLD) {
+                  log("warn", `own-loop: phase ${phaseNum} no-text loop`, { sessionId, step });
+                  yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Loop detected — summarizing progress so far]\n\n" };
+                  exitReason = "no-text-loop";
+                  break;
+                }
+              } else {
+                consecutiveNoTextSteps = 0;
+              }
+
+              const phFinishReason = await (phResult as unknown as { finishReason: PromiseLike<string> }).finishReason;
+
+              log("info", `own-loop: phase ${phase + 1} step complete`, {
+                sessionId,
+                step,
+                finishReason: phFinishReason,
+                budgetUsage: `${Math.round((cumulativeInputTokens / tokenBudget) * 100)}%`,
+                toolCalls: phLastStep?.toolCalls?.map(tc => tc.toolName) ?? [],
+              });
+
+              if (phFinishReason !== "tool-calls") break;
+              step++;
+            }
+
+            // Tag step-limit exit
+            if (step >= maxSteps && exitReason === "natural") {
+              exitReason = "step-limit";
+            }
+
+            // Accumulate phase tokens into total
+            totalInputTokens += cumulativeInputTokens;
+            totalOutputTokens += cumulativeOutputTokens;
+          } catch (err) {
+            totalInputTokens += cumulativeInputTokens;
+            totalOutputTokens += cumulativeOutputTokens;
+            log("warn", `own-loop: auto-continuation phase ${phase} failed`, {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            yield { type: "text-delta", id: crypto.randomUUID(), delta: "\n\n[Auto-continuation failed — send 'continue' to resume manually]\n\n" };
+            break;
+          }
+        }
+
+        // Use totals across all phases for _lastUsage
+        cumulativeInputTokens = totalInputTokens;
+        cumulativeOutputTokens = totalOutputTokens;
+
+        // ─── Store cumulative usage for runThinkChat to read ───
+        self._lastUsage = {
+          inputTokens: cumulativeInputTokens,
+          outputTokens: cumulativeOutputTokens,
+        };
+      },
+    };
+  }
+
+  /** Build an AppConfig from Think's per-session config, falling back to env defaults. */
+  private getAppConfigFromThink(): AppConfig {
+    const config = this.getConfig();
+    if (config) {
+      return {
+        activeGateway: config.activeGateway,
+        aiGatewayBaseURL: config.aiGatewayBaseURL,
+        gitAuthorEmail: config.gitAuthorEmail,
+        gitAuthorName: config.gitAuthorName,
+        model: config.model,
+        opencodeBaseURL: config.opencodeBaseURL,
+        systemPromptPrefix: config.systemPromptPrefix,
+        exploreModel: config.exploreModel,
+        taskModel: config.taskModel,
+        exploreMode: config.exploreMode ?? "inprocess",
+        taskMode: config.taskMode ?? "inprocess",
+      };
+    }
+    return {
+      activeGateway: "opencode",
+      aiGatewayBaseURL: this.env.AI_GATEWAY_BASE_URL,
+      gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+      gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
+      model: this.env.DEFAULT_MODEL,
+      opencodeBaseURL: this.env.OPENCODE_BASE_URL,
+      exploreModel: this.env.DEFAULT_EXPLORE_MODEL,
+      taskModel: this.env.DEFAULT_TASK_MODEL,
+      exploreMode: "inprocess",
+      taskMode: "inprocess",
+    };
+  }
+
+  override getMaxSteps(): number {
+    // High safety net — the token budget thresholds (warn at 70%,
+    // wrap-up at 85%, hard stop at 95%) are the real limiting factor.
+    // This just prevents truly runaway loops if budget tracking fails.
+    return 200;
+  }
+
+  /**
+   * Override assembleContext to apply compaction guardrails:
+   * 1. Per-tool output shaping: apply tool-aware truncation rules to prevent
+   *    context window bloat. Different tools get different response contracts.
+   * 2. Older tool results get aggressively truncated to free budget.
+   * 3. Enforce total token budget — drop oldest messages when the estimated
+   *    token count exceeds 80% of the model's context window.
+   *
+   * Instrumentation: logs per-turn stats (tool count, output bytes before/after,
+   * estimated tokens) for debugging token waste.
+   */
+  override async assembleContext(): Promise<ModelMessage[]> {
+    let messages = await super.assembleContext();
+
+    // ─── Inject compaction summary if missing ───
+    // Think's getHistory() is supposed to inject the compaction summary as a
+    // system UIMessage, but due to timing issues (stale this.messages, race
+    // conditions) it may not appear in the ModelMessage array after conversion.
+    // As a safety net, read the latest compaction directly from the DB and
+    // inject it if no system message with the summary marker exists.
+    const COMPACTION_MARKER = "[Previous conversation summary]";
+    const hasCompactionSummary = messages.some((msg) => {
+      if (msg.role !== "system") return false;
+      const text = typeof msg.content === "string" ? msg.content : "";
+      return text.startsWith(COMPACTION_MARKER);
+    });
+
+    if (!hasCompactionSummary) {
+      const thinkSessionId = this.getCurrentSessionId();
+      if (thinkSessionId) {
+        const compactions = this.sessions.getCompactions(thinkSessionId);
+        if (compactions.length > 0) {
+          const latest = compactions[compactions.length - 1];
+          const summaryContent = `${COMPACTION_MARKER}\n${latest.summary}`;
+          messages = [
+            { role: "system" as const, content: summaryContent },
+            ...messages,
+          ];
+          log("info", "assembleContext: injected compaction summary (safety net)", {
+            sessionId: this.sessionId(),
+            summaryChars: latest.summary.length,
+            compactionCount: compactions.length,
+          });
+        }
+      }
+    }
+
+    // ─── Selective message exclusion (Tactic 8) ───
+    // Messages prefixed with "!!" are visible in the UI but excluded from
+    // LLM context. Replace content with a minimal placeholder rather than
+    // filtering entirely — this avoids orphaned assistant responses that
+    // reference a message the model can't see on the current turn.
+    messages = messages.map((msg) => {
+      if (msg.role !== "user") return msg;
+      const content = typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("")
+          : "";
+      if (!content.startsWith("!!")) return msg;
+      return { ...msg, content: "[message excluded by user]" };
+    });
+
+    // ─── Per-tool output shaping ───
+    const useShaping = true; // Per-tool output shaping always enabled
+
+    // Max chars per tool result — ~8k chars ≈ ~2k tokens. Enough for most
+    // source files, tight enough to prevent context blowout from large reads.
+    const MAX_TOOL_OUTPUT_CHARS = 8_000;
+    // Older tool results (beyond this message index from the end) get aggressively truncated
+    const RECENT_MESSAGE_WINDOW = 4;
+    // Known large/low-value file patterns get extra-aggressive truncation
+    const LOW_VALUE_PATTERNS = [
+      /package-lock\.json/i,
+      /yarn\.lock/i,
+      /pnpm-lock\.yaml/i,
+      /\.min\.(js|css)$/i,
+      /\.map$/i,
+      /\.git\//,
+    ];
+    const LOW_VALUE_MAX_CHARS = 2_000;
+
+    const totalMessages = messages.length;
+    let toolCallCount = 0;
+    let totalOutputBytesBefore = 0;
+    let totalOutputBytesAfter = 0;
+    let truncatedCount = 0;
+
+    for (let i = 0; i < totalMessages; i++) {
+      const msg = messages[i];
+      if (msg.role !== "tool") continue;
+
+      const isRecent = i >= totalMessages - RECENT_MESSAGE_WINDOW;
+
+      for (const part of msg.content) {
+        if (part.type !== "tool-result" || part.output === undefined) continue;
+        toolCallCount++;
+        const output = part.output as { type?: string; value?: unknown };
+        if (!output || typeof output !== "object") continue;
+
+        const toolResult = part as { toolName?: string; input?: unknown };
+        const toolName = toolResult.toolName ?? "unknown";
+
+        // Serialize the value to measure size
+        const value = output.value;
+        const serialized = typeof value === "string" ? value : JSON.stringify(value);
+        const originalBytes = serialized.length;
+        totalOutputBytesBefore += originalBytes;
+
+        // ─── Per-tool output shaping (Phase 1.2) ───
+        if (useShaping) {
+          // Compact response tools: write, edit, delete, git_add, git_commit
+          // These should return a small status, not file contents.
+          const compactTools = new Set([
+            "write", "edit", "delete",
+            "git_add", "git_commit", "git_init",
+            "git_branch", "git_checkout",
+          ]);
+          if (compactTools.has(toolName) && originalBytes > 1_000) {
+            // These tools shouldn't produce large output — cap at 1KB
+            const capped = truncateToolOutput(serialized, {
+              maxChars: 1_000,
+              strategy: "middle",
+            });
+            if (output.type === "text") {
+              (output as { value: string }).value = capped;
+            } else {
+              (part as { output: unknown }).output = { type: "text", value: capped };
+            }
+            totalOutputBytesAfter += capped.length;
+            if (capped.length < originalBytes) truncatedCount++;
+            continue;
+          }
+          // Per-tool shaping for read/list/grep/find is handled at the tool
+          // level in agentic.ts:capToolOutputs, not here.
+        }
+
+        // ─── General truncation (existing + improved) ───
+        const argsStr = toolResult.input ? JSON.stringify(toolResult.input) : "";
+        const isLowValue = LOW_VALUE_PATTERNS.some((p) =>
+          p.test(argsStr) || p.test(serialized.slice(0, 500)),
+        );
+        // Non-recent tool results: clear entirely with marker (Pattern #3)
+        // Recent results: truncate to cap if oversized
+        if (!isRecent && serialized.length > 200) {
+          // Old results → zero-cost marker (~8 tokens vs ~500-2000 tokens)
+          if (output.type === "text") {
+            (output as { value: string }).value = CLEARED_MARKER;
+          } else {
+            (part as { output: unknown }).output = { type: "text", value: CLEARED_MARKER };
+          }
+          totalOutputBytesAfter += CLEARED_MARKER.length;
+          truncatedCount++;
+          continue;
+        }
+
+        let maxChars: number;
+        if (isLowValue) {
+          maxChars = LOW_VALUE_MAX_CHARS;
+        } else {
+          maxChars = MAX_TOOL_OUTPUT_CHARS;
+        }
+
+        if (serialized.length <= maxChars) {
+          totalOutputBytesAfter += serialized.length;
+          continue;
+        }
+
+        const truncated = truncateToolOutput(serialized, {
+          maxChars,
+          strategy: "middle",
+        });
+        truncatedCount++;
+
+        // Preserve the output shape but replace the value with truncated text
+        if (output.type === "text") {
+          (output as { value: string }).value = truncated;
+        } else {
+          (part as { output: unknown }).output = { type: "text", value: truncated };
+        }
+        totalOutputBytesAfter += truncated.length;
+      }
+    }
+
+    // ─── Token-budget enforcement (hybrid tracking) ───
+    // Anchor on provider-reported cumulative input tokens from the agentic loop,
+    // then only estimate the trailing delta (messages added since last LLM call).
+    // This bounds estimation error to 1-3 messages instead of the full history.
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const tokenBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+
+    // ─── Protect compaction summaries from being dropped ───
+    // The compaction summary (injected above or by Think's getHistory) MUST survive
+    // token-budget enforcement — it's the compressed representation of older messages.
+    const minProtectedIndex = messages.findIndex((msg) => {
+      if (msg.role !== "system") return false;
+      const text = typeof msg.content === "string" ? msg.content : "";
+      return text.startsWith(COMPACTION_MARKER);
+    });
+    // If a compaction summary exists, the cutoff must not go before it.
+    // Set the floor to the index AFTER the compaction summary so it's always included.
+    const cutoffFloor = minProtectedIndex >= 0 ? minProtectedIndex : 0;
+
+    // Build CutoffMessage array with pre-computed token estimates.
+    const cutoffMessages = messages.map((msg) => ({
+      role: msg.role,
+      tokens: estimateMessageTokens(msg),
+      pinned:
+        msg.role === "system" &&
+        (typeof msg.content === "string" ? msg.content : "").startsWith(COMPACTION_MARKER),
+    }));
+
+    const anchorTokens = this._lastUsage?.inputTokens ?? 0;
+    const cutoffResult = pickCutoff({
+      messages: cutoffMessages,
+      targetTokenBudget: tokenBudget,
+      anchorTokens: anchorTokens > 0 ? anchorTokens : undefined,
+      cutoffFloor,
+    });
+
+    const totalTokens = cutoffMessages
+      .slice(cutoffResult.cutoffIndex)
+      .reduce((sum, m) => sum + m.tokens, 0);
+
+    // Log compaction detection for debugging
+    if (messages.some((m) => m.role === "system")) {
+      log("info", "assembleContext: system messages found", {
+        sessionId: this.sessionId(),
+        totalMessages: messages.length,
+        systemCount: messages.filter((m) => m.role === "system").length,
+        minProtectedIndex,
+        systemPreviews: messages
+          .map((m, i) =>
+            m.role === "system"
+              ? {
+                  i,
+                  preview: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 80),
+                }
+              : null,
+          )
+          .filter(Boolean),
+      });
+    }
+
+    // ─── Current-turn overshoot check (Phase 1.4) ───
+    // Even after truncation, check if the most recent messages alone exceed budget.
+    // This catches the case where many tool calls in a single turn accumulate.
+    if (messages.length > 0) {
+      const lastMsg = messages[messages.length - 1];
+      const lastMsgTokens = estimateMessageTokens(lastMsg);
+      if (lastMsgTokens > tokenBudget * 0.5) {
+        log("warn", "assembleContext: single message uses >50% of token budget", {
+          sessionId: this.sessionId(),
+          role: lastMsg.role,
+          estimatedTokens: lastMsgTokens,
+          tokenBudget,
+          model: modelId,
+        });
+      }
+    }
+
+    // ─── Instrumentation (Phase 0.1) ───
+    log("info", "assembleContext", {
+      sessionId: this.sessionId(),
+      model: modelId,
+      messageCount: totalMessages,
+      toolCallCount,
+      outputBytesBefore: totalOutputBytesBefore,
+      outputBytesAfter: totalOutputBytesAfter,
+      truncatedToolResults: truncatedCount,
+      estimatedTokens: totalTokens,
+      tokenBudget,
+      contextWindow,
+      dropped: cutoffResult.cutoffIndex,
+    });
+
+    if (cutoffResult.cutoffIndex > 0 && cutoffResult.cutoffIndex < messages.length) {
+      this._contextTruncated = true;
+      const droppedCount = cutoffResult.cutoffIndex;
+      const hasCompactionSummary = minProtectedIndex >= 0 && minProtectedIndex < cutoffResult.cutoffIndex;
+      log("warn", "assembleContext: dropping oldest messages", {
+        sessionId: this.sessionId(),
+        droppedCount,
+        compactionSummaryProtected: minProtectedIndex >= 0,
+        model: modelId,
+        tokenBudget,
+      });
+
+      // If a compaction summary exists within the dropped range, preserve it
+      // at the front of the returned messages. The summary is the compressed
+      // representation of even older messages — losing it means total amnesia.
+      const preserved: ModelMessage[] = [];
+      if (hasCompactionSummary) {
+        preserved.push(messages[minProtectedIndex]);
+      }
+
+      const truncationNote: ModelMessage = {
+        role: "system" as const,
+        content: `[Earlier messages truncated — context window limit reached. ${droppedCount} message(s) dropped to stay within the ${contextWindow}-token context window.]`,
+      };
+
+      return [...preserved, truncationNote, ...messages.slice(cutoffResult.cutoffIndex)];
+    }
+
+    return messages;
+  }
+
+  override getWorkspace(): Workspace {
+    return this.workspace;
+  }
+
+  override onStart(): void {
+    // Initialize Think: creates SessionManager, loads existing sessions,
+    // sets up protocol handlers, checks fibers if enabled.
+    super.onStart();
+    this.mcp.configureOAuthCallback({
+      successRedirect: "/mcp-oauth-success",
+      errorRedirect: "/mcp-oauth-error",
+    });
+
+    // Arm the daily MCP-hygiene alarm if not already set. The alarm handler
+    // re-arms itself, so we only need to kick it off once per DO lifetime.
+    // Fire-and-forget — onStart() is sync per the Agents SDK contract.
+    this.ctx.waitUntil((async () => {
+      try {
+        const existing = await this.ctx.storage.getAlarm();
+        if (existing === null) {
+          await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
+        }
+      } catch (err) {
+        log("warn", "Failed to arm mcp-hygiene alarm", { err: err instanceof Error ? err.message : String(err) });
+      }
+    })());
+
+    // Suppress Think's WebSocket chat protocol.
+    // super.onStart() wraps onMessage via _setupProtocolHandlers() to intercept
+    // cf_agent_chat_* messages. We re-wrap onMessage to skip those protocol
+    // messages entirely, routing everything through Dodo's own handlers.
+    const thinkWrappedOnMessage = this.onMessage.bind(this);
+    this.onMessage = async (connection: Connection, message: WSMessage) => {
+      if (typeof message === "string") {
+        try {
+          const data = JSON.parse(message);
+          // Block Think's chat protocol messages
+          if (data.type === "cf_agent_use_chat_request" ||
+              data.type === "cf_agent_chat_clear" ||
+              data.type === "cf_agent_chat_request_cancel") {
+            return;
+          }
+        } catch {
+          // Not JSON — let it through
+        }
+      }
+      return thinkWrappedOnMessage(connection, message);
+    };
+
+    // Enforce single Think session per Dodo DO
+    this.ensureSingleThinkSession();
+
+    // Dodo's existing init logic
+    const details = this.readSessionDetails();
+    this.setState({
+      ...(this.state as SessionState),
+      ...details,
+      activeStreamCount: this.clients.size,
+      messageCount: this.messageCount(),
+    } as never);
+
+    // Reconcile orphaned prompt queue — if no prompt is active but the queue
+    // has items, the DO likely evicted between lifecycle.finish() clearing
+    // active_prompt_id and the queue dequeue running. Use lifecycle.start
+    // with source="queue" to drain a single item with the right policy.
+    if (!this.control.readActivePromptId()) {
+      void this.drainOneQueuedPrompt();
+    }
+  }
+
+  private async drainOneQueuedPrompt(): Promise<void> {
+    const next = (Array.from(this.ctx.storage.sql.exec("SELECT id, content, author_email FROM prompt_queue ORDER BY position ASC LIMIT 1"))[0] as SqlRow | null);
+    if (!next) return;
+    const queuedId = String(next.id);
+    const content = String(next.content);
+    const authorEmail = next.author_email ? String(next.author_email) : null;
+    this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queuedId);
+    this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+    await this.lifecycle.start({ source: "queue", content, authorEmail });
+  }
+
+  /**
+   * Ensure exactly one Think session exists per Dodo DO.
+   * Called from onStart() after super.onStart() initializes SessionManager.
+   */
+  private ensureSingleThinkSession(): void {
+    const existing = this.sessions.list();
+    if (existing.length === 0) {
+      // No session yet — create one. super.onStart() may have already
+      // created one if there were existing sessions, but not if the DO is fresh.
+      if (!this.getCurrentSessionId()) {
+        this.createSession("default");
+      }
+    } else if (existing.length > 1) {
+      // Multiple sessions — use most recent, delete extras
+      console.warn(`CodingAgent: found ${existing.length} Think sessions, expected 1. Using most recent.`);
+      const sorted = [...existing].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      // Switch to the most recent
+      this.switchSession(sorted[0].id);
+      for (let i = 1; i < sorted.length; i++) {
+        this.sessions.delete(sorted[i].id);
+      }
+    }
+    // If exactly 1 exists, super.onStart() already loaded it
+  }
+
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    // Normalise the incoming owner email and reconcile if it's drifted from
+    // the stored owner_email metadata. This runs for every HTTP request into
+    // the DO (sessions *and* the per-user OAuth hub) so Access identity drift
+    // is caught before any MCP call.
+    const incomingEmail = (request.headers.get("x-owner-email") ?? request.headers.get("x-dodo-owner-email") ?? "")
+      .trim()
+      .toLowerCase();
+    if (incomingEmail) {
+      await this.reconcileOwnerIdentity(incomingEmail);
+    }
+
+    try {
+      if (request.method === "GET" && url.pathname === "/ws") {
+        // Non-WebSocket request to the WS endpoint
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+
+      if (request.method === "GET" && url.pathname === "/") {
+        return Response.json(this.readSessionDetails());
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/") {
+        const ownerEmail = request.headers.get("x-owner-email");
+        if (ownerEmail && !this.readMetadata("owner_email")) {
+          this.writeMetadata("owner_email", ownerEmail);
+        }
+        const sid = this.sessionId();
+        await this.syncSessionIndex({ status: "deleted" });
+        await this.destroyStorage();
+        return Response.json({ deleted: true, sessionId: sid });
+      }
+
+      // MCP connection status — surfaces per-config connect/listTools results
+      // from the last connectMcpServers() run. Failures here are why tools
+      // sometimes silently fail to appear; the UI can read this endpoint to
+      // show "✗ <name>: <error>" alongside each MCP config row.
+      if (request.method === "GET" && url.pathname === "/mcp-status") {
+        const statuses = Array.from(this.mcpStatus.entries()).map(([id, s]) => ({
+          id,
+          name: s.name,
+          url: s.url,
+          ok: s.ok,
+          toolCount: s.toolCount,
+          error: s.error,
+          lastCheckedAt: s.lastCheckedAt,
+        }));
+        return Response.json({ statuses });
+      }
+
+      // Debug endpoint: run compaction diagnostics without side effects
+      if (request.method === "GET" && url.pathname === "/debug/compaction") {
+        const thinkSid = this.getCurrentSessionId();
+        if (!thinkSid) return Response.json({ error: "no session" });
+
+        const cfg = this.getConfig();
+        const mid = cfg?.model ?? this.env.DEFAULT_MODEL ?? "";
+        const cw = CONTEXT_WINDOW_TOKENS[mid] ?? DEFAULT_CONTEXT_WINDOW;
+        const cb = Math.floor(cw * CONTEXT_BUDGET_FACTOR);
+
+        const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
+          "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+        ))[0] as SqlRow | null);
+        const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
+        const usagePct = cb > 0 ? Math.round((lastInputTokens / cb) * 100) : 0;
+
+        const history = this.sessions.getHistory(thinkSid);
+        const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
+        const compactions = this.sessions.getCompactions(thinkSid);
+
+        const targetCompactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
+        const fromId = realMessages.length > 0 ? realMessages[0].id : null;
+        const toId = realMessages.length >= targetCompactCount ? realMessages[targetCompactCount - 1].id : null;
+
+        const alreadyCompacted = fromId && toId ? compactions.some(
+          (c) => c.from_message_id === fromId || c.to_message_id === toId,
+        ) : false;
+
+        // Check serialization: would we get any content?
+        let serializedCount = 0;
+        for (const msg of realMessages.slice(0, targetCompactCount)) {
+          const textContent = msg.parts
+            ?.filter((p: { type: string }) => p.type === "text")
+            .map((p: { type: string; text?: string }) => (p as { text: string }).text)
+            .join("") ?? "";
+          if (textContent) serializedCount++;
+        }
+
+        return Response.json({
+          thinkSessionId: thinkSid,
+          model: mid,
+          contextWindow: cw,
+          contextBudget: cb,
+          lastInputTokens,
+          usagePercent: usagePct,
+          triggerThreshold: COMPACTION_TRIGGER_PERCENT,
+          wouldTrigger: usagePct >= COMPACTION_TRIGGER_PERCENT,
+          historyLength: history.length,
+          realMessageCount: realMessages.length,
+          compactionCount: compactions.length,
+          targetCompactCount,
+          fromId,
+          toId,
+          alreadyCompacted,
+          serializedCount,
+          historyRoles: history.map(m => `${m.role}:${m.id.slice(0, 8)}`),
+        });
+      }
+
+      if (request.method === "GET" && url.pathname === "/messages") {
+        return Response.json({ messages: this.listMessages() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/prompts") {
+        return Response.json({ prompts: this.listPrompts() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/todos") {
+        return Response.json({ items: this.listTodos() });
+      }
+
+      if (request.method === "GET" && url.pathname === "/prompts/count") {
+        // Lightweight count endpoint used by the UserControl idle-session
+        // sweep. Full /prompts would serialise the whole list.
+        const row = (Array.from(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM prompts"))[0] as SqlRow | null);
+        return Response.json({ count: Number(row?.n ?? 0) });
+      }
+
+      if (request.method === "GET" && url.pathname === "/prompt-queue") {
+        return Response.json(this.readQueueState());
+      }
+
+      if (request.method === "DELETE" && url.pathname.startsWith("/prompt-queue/")) {
+        const queueId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+        this.ctx.storage.sql.exec("DELETE FROM prompt_queue WHERE id = ?", queueId);
+        this.emitEvent({ data: this.readQueueState(), type: "queue_update" });
+        return Response.json({ deleted: true, id: queueId });
+      }
+
+      if (request.method === "GET" && url.pathname === "/cron") {
+        return Response.json({ jobs: this.listCronJobs() });
+      }
+
+      if (request.method === "POST" && url.pathname === "/cron") {
+        return await this.handleCreateCron(request);
+      }
+
+      if (request.method === "DELETE" && url.pathname.startsWith("/cron/")) {
+        return await this.handleDeleteCron(url.pathname.split("/").at(-1) ?? "");
+      }
+
+      // Session watchdog — autonomous stall detection for long-running
+      // prompts. PUT installs/replaces a watchdog; GET reports config
+      // + counters; DELETE removes the watchdog and cancels its
+      // schedule. See src/watchdog.ts for the pure decision logic.
+      if (request.method === "GET" && url.pathname === "/watchdog") {
+        return Response.json(this.watchdogStore.read());
+      }
+      if (request.method === "PUT" && url.pathname === "/watchdog") {
+        return await this.handleInstallWatchdog(request);
+      }
+      if (request.method === "DELETE" && url.pathname === "/watchdog") {
+        return await this.handleDeleteWatchdog();
+      }
+
+      // Phase 5 — facet transcripts surface. Two read-only endpoints
+      // backing the `GET /session/:id/facets` /
+      // `GET /session/:id/facets/:facetName/transcript` HTTP routes.
+      if (request.method === "GET" && url.pathname === "/facets") {
+        const limit = Number(url.searchParams.get("limit") ?? 50);
+        return Response.json({ runs: await this.listFacetRuns(limit) });
+      }
+
+      if (url.pathname.startsWith("/facets/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        // GET /facets/<facetName>/transcript
+        if (request.method === "GET" && parts.length === 3 && parts[2] === "transcript") {
+          const facetName = decodeURIComponent(parts[1]);
+          const transcript = await this.getFacetTranscript(facetName);
+          if (!transcript) {
+            return Response.json({ error: "facet not found" }, { status: 404 });
+          }
+          return Response.json(transcript);
+        }
+        // POST /facets/<facetName>/apply — merge scratch writes back
+        // into the parent workspace. Body: { paths: string[] }.
+        if (request.method === "POST" && parts.length === 3 && parts[2] === "apply") {
+          const facetName = decodeURIComponent(parts[1]);
+          let body: { paths?: unknown };
+          try {
+            body = (await request.json()) as { paths?: unknown };
+          } catch {
+            return Response.json({ error: "invalid JSON body" }, { status: 400 });
+          }
+          if (!Array.isArray(body.paths) || !body.paths.every((p) => typeof p === "string")) {
+            return Response.json(
+              { error: "body.paths must be an array of strings" },
+              { status: 400 },
+            );
+          }
+          const paths = body.paths as string[];
+          if (paths.length === 0) {
+            return Response.json(
+              { error: "body.paths must be non-empty" },
+              { status: 400 },
+            );
+          }
+          if (paths.length > 500) {
+            return Response.json(
+              { error: "body.paths too large (max 500 per call)" },
+              { status: 400 },
+            );
+          }
+          try {
+            const result = await this.applyTaskScratch(facetName, paths);
+            return Response.json(result);
+          } catch (err) {
+            if (err instanceof FacetNotFoundError) {
+              return Response.json({ error: "facet not found" }, { status: 404 });
+            }
+            throw err;
+          }
+        }
+      }
+
+      if (request.method === "GET" && url.pathname === "/snapshot") {
+        // Phase 0 diagnostics for fork-snapshot 400s — measure the
+        // serialized JSON size before it crosses the wire so we know
+        // exactly what the receiver is dealing with. (plan
+        // 2026-04-25-dodo-seed-fork-large-snapshot.md phase 0)
+        const exportStart = Date.now();
+        const snapshot = await this.exportSnapshot();
+        const exportMs = Date.now() - exportStart;
+        const serializeStart = Date.now();
+        const json = JSON.stringify(snapshot);
+        const serializeMs = Date.now() - serializeStart;
+        const fileCount = Array.isArray((snapshot as { files?: unknown[] }).files)
+          ? (snapshot as { files: unknown[] }).files.length
+          : 0;
+        log("info", "snapshot: exported", {
+          sessionId: this.sessionId() || request.headers.get("x-dodo-session-id") || "",
+          fileCount,
+          jsonBytes: json.length,
+          jsonSizeMB: (json.length / 1024 / 1024).toFixed(2),
+          exportMs,
+          serializeMs,
+        });
+        return new Response(json, {
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(json.length),
+          },
+        });
+      }
+
+      if (request.method === "POST" && (url.pathname === "/snapshot" || url.pathname === "/snapshot/import")) {
+        return await this.handleImportSnapshot(request);
+      }
+
+      if (request.method === "GET" && url.pathname === "/events") {
+        return await this.openEventStream(request);
+      }
+
+      if (request.method === "GET" && url.pathname === "/browser") {
+        const enabled = this.readMetadata("browser_enabled") === "true";
+        const sid = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
+        return Response.json({ browserEnabled: enabled, sessionId: sid });
+      }
+
+      if (request.method === "PUT" && url.pathname === "/browser") {
+        const body = (await request.json()) as { enabled?: boolean };
+        const enabled = Boolean(body.enabled);
+        this.writeMetadata("browser_enabled", String(enabled));
+        const sid = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
+        return Response.json({ browserEnabled: enabled, sessionId: sid });
+      }
+
+      if (request.method === "GET" && url.pathname === "/goal") {
+        return Response.json(this.readGoalState());
+      }
+
+      if (request.method === "PUT" && url.pathname === "/goal") {
+        const body = (await request.json()) as { text?: string; maxTurns?: number; role?: string };
+        if (typeof body.text !== "string" || body.text.trim().length === 0) {
+          return Response.json({ error: "text required (non-empty string)" }, { status: 400 });
+        }
+        const state = this.setGoal({
+          text: body.text,
+          maxTurns: body.maxTurns,
+          role: body.role,
+        });
+        return Response.json(state);
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/goal") {
+        this.clearGoal();
+        return Response.json({ cleared: true });
+      }
+
+      if (request.method === "PUT" && url.pathname === "/autopilot-flag") {
+        const body = (await request.json()) as { isAutopilot?: boolean; role?: string };
+        const isAutopilot = Boolean(body.isAutopilot);
+        this.writeMetadata("is_autopilot", String(isAutopilot));
+        if (body.role) {
+          this.writeMetadata("autopilot_role", body.role);
+        }
+        return Response.json({ isAutopilot, role: body.role ?? null });
+      }
+
+      if (request.method === "GET" && url.pathname === "/autopilot-flag") {
+        const isAutopilot = this.readMetadata("is_autopilot") === "true";
+        const role = this.readMetadata("autopilot_role");
+        return Response.json({ isAutopilot, role });
+      }
+
+      // Chat-monitor brain flag — mirrors autopilot-flag. Set by
+      // ChatMonitorAgent when it spawns a brain session; the `chat_reply`
+      // MCP tool refuses to send unless the calling session has this flag.
+      if (request.method === "PUT" && url.pathname === "/chat-monitor-flag") {
+        const body = (await request.json()) as { isChatMonitorBrain?: boolean; spaceId?: string };
+        const flag = Boolean(body.isChatMonitorBrain);
+        this.writeMetadata("is_chat_monitor_brain", String(flag));
+        if (typeof body.spaceId === "string" && body.spaceId.length > 0) {
+          this.writeMetadata("chat_monitor_space_id", body.spaceId);
+        } else if (!flag) {
+          this.writeMetadata("chat_monitor_space_id", "");
+        }
+        return Response.json({ isChatMonitorBrain: flag, spaceId: body.spaceId ?? null });
+      }
+
+      if (request.method === "GET" && url.pathname === "/chat-monitor-flag") {
+        const flag = this.readMetadata("is_chat_monitor_brain") === "true";
+        const spaceId = this.readMetadata("chat_monitor_space_id") || null;
+        return Response.json({ isChatMonitorBrain: flag, spaceId });
+      }
+
+      // Per-session system-prompt prefix. Mirrors the user-level
+      // `systemPromptPrefix` but is local to this session. Used by
+      // ChatMonitorAgent to install the chat-monitor brain's persona +
+      // hard rules. Layered ABOVE user/admin prefixes in getSystemPrompt.
+      if (request.method === "PUT" && url.pathname === "/system-prompt-prefix") {
+        const body = (await request.json()) as { text?: string };
+        if (typeof body.text === "string") {
+          this.writeMetadata("session_system_prompt_prefix", body.text);
+        } else {
+          this.writeMetadata("session_system_prompt_prefix", "");
+        }
+        return Response.json({ ok: true });
+      }
+
+      if (request.method === "GET" && url.pathname === "/system-prompt-prefix") {
+        return Response.json({ text: this.readMetadata("session_system_prompt_prefix") || "" });
+      }
+
+      if (request.method === "GET" && url.pathname === "/files") {
+        return await this.handleListFiles(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/file") {
+        return await this.handleReadFile(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/artifacts") {
+        return await this.handleArtifactsInfo(request);
+      }
+
+      if (request.method === "PUT" && url.pathname === "/file") {
+        return await this.handleWriteFile(request, url);
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/file") {
+        return await this.handleReplaceInFile(request, url);
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/file") {
+        return await this.handleDeleteFile(url);
+      }
+
+      if (request.method === "POST" && url.pathname === "/search") {
+        return await this.handleSearchFiles(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/execute") {
+        return await this.handleExecute(request);
+      }
+
+      if (request.method === "GET" && url.pathname === "/git/status") {
+        return await this.handleGitStatus(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/git/log") {
+        return await this.handleGitLog(url);
+      }
+
+      if (request.method === "GET" && url.pathname === "/git/diff") {
+        return await this.handleGitDiff(url);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/init") {
+        return await this.handleGitInit(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/clone") {
+        return await this.handleGitClone(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/add") {
+        return await this.handleGitAdd(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/commit") {
+        return await this.handleGitCommit(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/branch") {
+        return await this.handleGitBranch(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/checkout") {
+        return await this.handleGitCheckout(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/pull") {
+        return await this.handleGitPull(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/push") {
+        return await this.handleGitPush(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/push-checked") {
+        return await this.handleGitPushChecked(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/verify-branch") {
+        return await this.handleGitVerifyBranch(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/remote") {
+        return await this.handleGitRemote(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/git/publish-to-github") {
+        return await this.handleGitPublishToGitHub(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/message") {
+        return await this.handleMessage(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/prompt") {
+        return await this.handlePrompt(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/generate") {
+        return await this.handleGenerate(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/abort") {
+        return await this.handleAbort();
+      }
+
+      return new Response("Not Found", { status: 404 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unexpected request failure";
+      return Response.json({ error: message }, { status: 400 });
+    }
+  }
+
+  // ─── WebSocket lifecycle (Agent SDK / partyserver) ───
+
+  async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    const url = new URL(ctx.request.url);
+    const email = url.searchParams.get("email") ?? "anonymous";
+    const displayName = url.searchParams.get("displayName") ?? email;
+    const permission = url.searchParams.get("permission") ?? "readwrite";
+    const lastMessageCountParam = url.searchParams.get("lastMessageCount");
+
+    // Cap'n Web RPC protocol — store transport for message routing
+    if (url.searchParams.get("protocol") === "capnweb") {
+      const transport = new AgentConnectionTransport(connection);
+      this.transports.set(connection.id, transport);
+      // Future: create RpcSession with transport and wire to DodoPublicApi
+      // For now, the transport is stored so onMessage can route to it.
+      return;
+    }
+
+    this.presence.join(connection.id, {
+      connectedAt: Date.now(),
+      displayName,
+      email,
+      permission,
+    });
+
+    // Determine which messages to send in the ready payload.
+    // If the client provides lastMessageCount (reconnection), only send
+    // messages they haven't seen yet. Otherwise send the last 50.
+    const allMessages = this.listMessages();
+    let messages: ChatMessageRecord[];
+    if (lastMessageCountParam !== null) {
+      const lastCount = Math.max(0, parseInt(lastMessageCountParam, 10) || 0);
+      messages = allMessages.slice(lastCount);
+    } else {
+      messages = allMessages.slice(-50);
+    }
+
+    const readyPayload = JSON.stringify({
+      type: "ready",
+      state: this.readSessionDetails(),
+      presence: this.presence.getAll(),
+      messages,
+      totalMessages: allMessages.length,
+    });
+    connection.send(readyPayload);
+
+    // Broadcast updated presence to all WebSocket clients
+    this.broadcastPresence();
+  }
+
+  async onMessage(connection: Connection, message: WSMessage): Promise<void> {
+    if (typeof message !== "string") return;
+
+    // Route Cap'n Web RPC messages to the stored transport
+    const transport = this.transports.get(connection.id);
+    if (transport) {
+      transport.deliver(message);
+      return;
+    }
+
+    this.presence.updateActivity(connection.id);
+
+    let parsed: { type: string; [key: string]: unknown };
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      connection.send(JSON.stringify({ type: "error", error: "Invalid JSON" }));
+      return;
+    }
+
+    // Enforce permission: readonly clients cannot perform write actions
+    const writeActions = new Set(["prompt", "message", "abort", "cron-create", "cron-delete"]);
+    if (writeActions.has(parsed.type)) {
+      const permission = this.getConnectionPermission(connection);
+      if (permission === "readonly") {
+        return; // silently drop — readonly clients cannot perform write actions
+      }
+    }
+
+    switch (parsed.type) {
+      case "ping":
+        connection.send(JSON.stringify({ type: "pong" }));
+        break;
+
+      case "typing": {
+        const isTyping = Boolean(parsed.isTyping);
+        this.presence.setTyping(connection.id, isTyping);
+        this.broadcastTyping();
+        break;
+      }
+
+      case "prompt": {
+        const content = typeof parsed.content === "string" ? parsed.content.trim() : "";
+        const entry = this.presence.get(connection.id);
+        const sessionId = this.sessionId();
+        if (!sessionId) {
+          connection.send(JSON.stringify({ type: "error", error: "Session not initialized" }));
+          return;
+        }
+        const r = await this.lifecycle.start({ source: "user", content, authorEmail: entry?.email });
+        if (r.kind === "rejected") {
+          connection.send(JSON.stringify({ type: "error", error: r.message }));
+        } else if (r.kind === "queued") {
+          connection.send(JSON.stringify({ type: "prompt_queued", promptId: r.promptId, position: r.position, queued: true }));
+        } else if (r.kind === "started") {
+          connection.send(JSON.stringify({ type: "prompt_queued", promptId: r.promptId }));
+        }
+        break;
+      }
+
+      case "abort": {
+        const r = await this.lifecycle.abortActive();
+        if (r.kind === "noop") {
+          connection.send(JSON.stringify({ type: "error", error: "No active prompt" }));
+        } else {
+          connection.send(JSON.stringify({ type: "aborted", promptId: r.promptId }));
+        }
+        break;
+      }
+
+      default:
+        connection.send(JSON.stringify({ type: "error", error: `Unknown message type: ${parsed.type}` }));
+    }
+  }
+
+  async onClose(connection: Connection): Promise<void> {
+    // Clean up Cap'n Web transport if present
+    const transport = this.transports.get(connection.id);
+    if (transport) {
+      transport.close();
+      this.transports.delete(connection.id);
+    }
+
+    const hadEntry = this.presence.has(connection.id);
+    this.presence.leave(connection.id);
+    if (hadEntry) {
+      this.broadcastPresence();
+    }
+  }
+
+  async onError(connectionOrError: Connection | unknown, error?: unknown): Promise<void> {
+    // Handle the Connection overload
+    if (connectionOrError && typeof connectionOrError === "object" && "id" in connectionOrError) {
+      const connection = connectionOrError as Connection;
+      // Clean up Cap'n Web transport if present
+      const transport = this.transports.get(connection.id);
+      if (transport) {
+        transport.abort(error);
+        this.transports.delete(connection.id);
+      }
+      this.presence.leave(connection.id);
+      this.broadcastPresence();
+    }
+  }
+
+  /** Broadcast a JSON message to all connected WebSocket clients (excluding one). */
+  private broadcastToWebSockets(message: string, excludeId?: string): void {
+    for (const conn of this.getConnections()) {
+      if (excludeId && conn.id === excludeId) continue;
+      try {
+        conn.send(message);
+      } catch {
+        // connection may have closed
+      }
+    }
+  }
+
+  /** Get the permission level for a WebSocket connection. */
+  private getConnectionPermission(connection: Connection): string {
+    const entry = this.presence.get(connection.id);
+    return entry?.permission ?? "readonly";
+  }
+
+  /** Broadcast current presence list to all WebSocket clients. */
+  private broadcastPresence(): void {
+    const payload = JSON.stringify({
+      type: "presence",
+      users: this.presence.getAll(),
+    });
+    this.broadcastToWebSockets(payload);
+  }
+
+  /** Broadcast current typing users to all WebSocket clients. */
+  private broadcastTyping(): void {
+    const payload = JSON.stringify({
+      type: "typing",
+      users: this.presence.getAll().filter((u) => u.isTyping),
+    });
+    this.broadcastToWebSockets(payload);
+  }
+
+  private initializeSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    // Sidecar metadata for Think messages — Dodo-specific fields
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS message_metadata (
+        message_id TEXT PRIMARY KEY,
+        author_email TEXT,
+        model TEXT,
+        provider TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    // Attachment refs (screenshots, generated images, user uploads) tied to
+    // a specific message. Stored here instead of inside the Think UIMessage
+    // parts because:
+    //   1. Think's enforceRowSizeLimit replaces tool outputs > 1KB with a
+    //      placeholder during persistence — base64 screenshots would vanish.
+    //   2. Tool-result events fire with the tool_call_id before the assistant
+    //      message the tool ran under has an id. Persisting refs here (keyed
+    //      by message_id — initially the tool_call bucket, later rebound to
+    //      the assistant message id once known) lets history restore surface
+    //      screenshots for the right message on reload.
+    //
+    // R2 lifecycle (30 days) is the canonical retention; this table is just
+    // a pointer index. If a pointer outlives its R2 object the client gets
+    // a 404 on load — acceptable degradation for long-gone history.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS message_attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT NOT NULL,
+        tool_call_id TEXT,
+        media_type TEXT NOT NULL,
+        url TEXT NOT NULL,
+        size INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_message_attachments_msg ON message_attachments(message_id)",
+    );
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS prompts (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error TEXT,
+        result_message_id TEXT,
+        fiber_id TEXT,
+        author_email TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS cron_jobs (
+        schedule_id TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_queue (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        author_email TEXT,
+        created_at INTEGER NOT NULL,
+        position INTEGER NOT NULL
+      )
+    `);
+
+    // Per-session todo list — backs the `todo_*` tools. Scoped to the
+    // session so no cross-session leakage. Persisted through compaction
+    // (which summarizes messages, not this table) so the model always
+    // has a stable checklist to refer to after context summaries.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_todos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','in_progress','completed','cancelled')),
+        priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    // Phase 5 — facet run index. Tracks every ExploreAgent / TaskAgent
+    // invocation on this session so `GET /session/:id/facets` can
+    // enumerate recent facet runs and deep-link into their transcripts.
+    //
+    // One row per run; facet transcripts themselves live in the facet
+    // DO's own SQLite (see ExploreAgent.getTranscript / TaskAgent.getTranscript).
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS facet_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        facet_type TEXT NOT NULL CHECK(facet_type IN ('explore','task')),
+        facet_name TEXT NOT NULL,
+        input TEXT NOT NULL,
+        summary_preview TEXT,
+        token_input INTEGER NOT NULL DEFAULT 0,
+        token_output INTEGER NOT NULL DEFAULT 0,
+        workspace_mode TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        status TEXT NOT NULL CHECK(status IN ('running','completed','failed'))
+      )
+    `);
+
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_position ON prompt_queue(position ASC)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_session_todos_status ON session_todos(status)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_started ON facet_runs(started_at DESC)");
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_facet_runs_name ON facet_runs(facet_name)");
+  }
+
+  /**
+   * Expose a stable read/write surface to the `todo_*` tools in agentic.ts
+   * without coupling them to the DO internals. Each method is a small,
+   * synchronous SQL operation — no async bookkeeping needed.
+   */
+  private listTodos(): TodoItem[] {
+    const rows = Array.from(this.ctx.storage.sql.exec(
+      "SELECT id, content, status, priority, created_at, updated_at FROM session_todos ORDER BY id ASC",
+    ));
+    return rows.map((r) => ({
+      id: Number(r.id),
+      content: String(r.content),
+      status: r.status as TodoStatus,
+      priority: r.priority as TodoPriority,
+    }));
+  }
+
+  /** Broadcast the current todo list to all SSE/WebSocket subscribers. */
+  private emitTodos(): void {
+    this.emitEvent({ data: { items: this.listTodos() }, type: "todos" });
+  }
+
+  private todoStore(): TodoStore {
+    return {
+      list: () => this.listTodos(),
+      add: (content, priority) => {
+        const now = nowEpoch();
+        this.ctx.storage.sql.exec(
+          "INSERT INTO session_todos (content, status, priority, created_at, updated_at) VALUES (?, 'pending', ?, ?, ?)",
+          content,
+          priority ?? "medium",
+          now,
+          now,
+        );
+        this.emitTodos();
+      },
+      update: (id, patch) => {
+        const now = nowEpoch();
+        const existing = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM session_todos WHERE id = ?", id))[0] as SqlRow | null);
+        if (!existing) return false;
+        if (patch.status) {
+          this.ctx.storage.sql.exec(
+            "UPDATE session_todos SET status = ?, updated_at = ? WHERE id = ?",
+            patch.status,
+            now,
+            id,
+          );
+        }
+        if (patch.content) {
+          this.ctx.storage.sql.exec(
+            "UPDATE session_todos SET content = ?, updated_at = ? WHERE id = ?",
+            patch.content,
+            now,
+            id,
+          );
+        }
+        if (patch.priority) {
+          this.ctx.storage.sql.exec(
+            "UPDATE session_todos SET priority = ?, updated_at = ? WHERE id = ?",
+            patch.priority,
+            now,
+            id,
+          );
+        }
+        this.emitTodos();
+        return true;
+      },
+      clear: () => {
+        this.ctx.storage.sql.exec("DELETE FROM session_todos");
+        this.emitTodos();
+      },
+    };
+  }
+
+  private async handleListFiles(url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "/");
+
+    // Fast path: serve from the cached artifacts clone when available.
+    // The cache only exists once a turn has flushed; before that, fall
+    // through to the workspace shell so the first turn renders normally.
+    // We catch any error so a transient artifacts hiccup never breaks
+    // the file tree.
+    try {
+      const cache = await this.getArtifactsFsCache();
+      if (cache) {
+        const result = await listArtifactsTree(cache, path);
+        if (result) return Response.json(result);
+      }
+    } catch (err) {
+      log("warn", "[files] artifacts fast-path failed, falling back", { path, err: err instanceof Error ? err.message : String(err) });
+    }
+
+    const entries = await this.workspace.readDir(path);
+    return Response.json({ entries: entries.map((entry) => this.mapWorkspaceEntry(entry)) });
+  }
+
+  private async handleReadFile(url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+
+    // Same fast-path strategy as handleListFiles. If the file isn't
+    // present in the artifacts clone (e.g. written this turn but not
+    // yet flushed) we drop through to the workspace.
+    try {
+      const cache = await this.getArtifactsFsCache();
+      if (cache) {
+        const result = await readArtifactsFile(cache, path);
+        if (result) return Response.json(result);
+      }
+    } catch (err) {
+      log("warn", "[file] artifacts fast-path failed, falling back", { path, err: err instanceof Error ? err.message : String(err) });
+    }
+
+    const content = await this.workspace.readFile(path);
+    if (content === null) {
+      return Response.json({ error: `File not found: ${path}` }, { status: 404 });
+    }
+
+    return Response.json({ content, path });
+  }
+
+  /**
+   * Return artifacts repo metadata + a short-lived authenticated clone
+   * URL the customer can paste into a terminal. Token TTL matches what
+   * `getOrCreateArtifactsContext` mints (1h).
+   *
+   * Falls back to the `x-dodo-session-id` header for the session id
+   * hint — DO metadata isn't populated until the first message/prompt
+   * runs through `ensureMetadata`, so a fresh session that has only
+   * ever been hit on this endpoint would otherwise lose the name.
+   */
+  private async handleArtifactsInfo(request: Request): Promise<Response> {
+    const sessionIdHint = this.sessionId() || request.headers.get("x-dodo-session-id") || "";
+    const ctx = await this.getOrCreateArtifactsContext(sessionIdHint).catch(() => null);
+    if (!ctx) {
+      return Response.json({ error: "Artifacts unavailable for this session" }, { status: 503 });
+    }
+    const cloneUrl = buildArtifactsCloneUrl(ctx.remote, ctx.tokenSecret);
+    return Response.json({
+      name: sessionIdHint ? `dodo-${sessionIdHint}` : null,
+      remote: ctx.remote,
+      cloneUrl,
+      // Surface the same TTL the binding minted so the UI can show
+      // an accurate "regenerate" hint as expiry approaches.
+      tokenTtlSeconds: ARTIFACTS_TOKEN_TTL_SECONDS,
+    });
+  }
+
+  private async handleWriteFile(request: Request, url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    const body = writeFileSchema.parse(await request.json());
+    await this.workspace.writeFile(path, body.content, body.mimeType);
+    const content = await this.workspace.readFile(path);
+    this.emitEvent({ data: { path, type: "write" }, type: "file" });
+    return Response.json({ content, path, written: true });
+  }
+
+  private async handleReplaceInFile(request: Request, url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    const body = replaceFileSchema.parse(await request.json());
+    const result = await this.stateBackend.replaceInFile(path, body.search, body.replacement);
+    this.emitEvent({ data: { path, type: "edit" }, type: "file" });
+    return Response.json({ path, result });
+  }
+
+  private async handleDeleteFile(url: URL): Promise<Response> {
+    const path = normalizePath(url.searchParams.get("path") ?? "");
+    if (path === "/") {
+      return Response.json({ error: "Cannot delete workspace root" }, { status: 400 });
+    }
+    await this.workspace.rm(path, { force: true, recursive: true });
+    this.emitEvent({ data: { path, type: "delete" }, type: "file" });
+    return Response.json({ deleted: true, path });
+  }
+
+  private async handleSearchFiles(request: Request): Promise<Response> {
+    const body = searchFilesSchema.parse(await request.json());
+    const result = await this.stateBackend.searchFiles(body.pattern, body.query);
+    return Response.json({ matches: result });
+  }
+
+  private async handleExecute(request: Request): Promise<Response> {
+    const body = executeCodeSchema.parse(await request.json());
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    this.ensureMetadata(this.requireSessionId(request), ownerEmail);
+
+    if (!this.env.LOADER) {
+      throw new Error("Dynamic Worker loader is not configured");
+    }
+
+    const outbound = this.env.OUTBOUND ?? null;
+
+    const executor = new DynamicWorkerExecutor({
+      globalOutbound: outbound,
+      loader: this.env.LOADER,
+      timeout: 30000,
+    });
+
+    const execution: ExecuteResult = await executor.execute(body.code, [resolveProvider(stateTools(this.workspace))]);
+
+    this.emitEvent({ data: execution, type: "execution" });
+    return Response.json(execution, { status: execution.error ? 400 : 200 });
+  }
+
+  private async handleGitInit(request: Request): Promise<Response> {
+    const body = gitDirSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const result = await git.init({ defaultBranch: "main", dir: body.dir ? normalizePath(body.dir) : undefined });
+    return Response.json(result);
+  }
+
+  private async handleGitClone(request: Request): Promise<Response> {
+    const body = gitCloneSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, url: body.url, ownerEmail });
+    // depth 0 = full history (pass undefined to isomorphic-git), undefined = shallow default of 1
+    const cloneDepth = body.depth === 0 ? undefined : (body.depth ?? 1);
+    const result = await git.clone({
+      branch: body.branch,
+      depth: cloneDepth,
+      dir,
+      singleBranch: body.singleBranch ?? true,
+      token,
+      url: body.url,
+    });
+    return Response.json(result);
+  }
+
+  private async handleGitAdd(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), filepath: z.string().min(1) }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    try {
+      return Response.json(await git.add({ dir: body.dir ? normalizePath(body.dir) : undefined, filepath: body.filepath }));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError") || msg.includes("Could not find .git")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  private async handleGitCommit(request: Request): Promise<Response> {
+    const body = gitCommitSchema.parse(await request.json());
+    const ownerEmail = request.headers.get("x-owner-email");
+    if (ownerEmail && !this.readMetadata("owner_email")) {
+      this.writeMetadata("owner_email", ownerEmail);
+    }
+    const git = createWorkspaceGit(this.workspace);
+    try {
+      const dir = body.dir ? normalizePath(body.dir) : undefined;
+      const statusEntries = await git.status({ dir });
+      if (!Array.isArray(statusEntries) || statusEntries.length === 0) {
+        return Response.json({ error: "Nothing to commit. Make sure you edited files and staged them before committing." }, { status: 400 });
+      }
+      const config = await this.readAppConfig();
+      // Use x-author-email when present so guest commits land under the
+      // committing human's identity, not the session owner's. The header
+      // is set server-side from the authenticated email — clients can't
+      // spoof it. (audit finding M10)
+      const authorEmail = request.headers.get("x-author-email");
+      const result = await git.commit({ author: defaultAuthor(config, authorEmail), dir, message: body.message });
+      return Response.json(result);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // Translate common git errors into actionable messages
+      if (msg.includes("startsWith") || msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        // Check if git is initialized
+        try {
+          await git.log({ depth: 1, dir: body.dir ? normalizePath(body.dir) : undefined });
+        } catch {
+          return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+        }
+        return Response.json({ error: "Nothing to commit. Stage files with git_add before committing." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  private async handleGitStatus(url: URL): Promise<Response> {
+    const git = createWorkspaceGit(this.workspace);
+    const dir = url.searchParams.get("dir");
+    try {
+      const entries = await git.status({ dir: dir ? normalizePath(dir) : undefined });
+      return Response.json({ entries });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  private async handleGitLog(url: URL): Promise<Response> {
+    const git = createWorkspaceGit(this.workspace);
+    const dir = url.searchParams.get("dir");
+    const depth = url.searchParams.get("depth");
+    try {
+      const entries = await git.log({ depth: depth ? Number(depth) : undefined, dir: dir ? normalizePath(dir) : undefined });
+      return Response.json({ entries });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git history found. Run git_init to create a repository, or git_clone to clone an existing one." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  private async handleGitDiff(url: URL): Promise<Response> {
+    const git = createWorkspaceGit(this.workspace);
+    const dir = url.searchParams.get("dir");
+    try {
+      const entries = await git.diff({ dir: dir ? normalizePath(dir) : undefined });
+      return Response.json({ entries });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  private async handleGitBranch(request: Request): Promise<Response> {
+    const body = gitBranchSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    return Response.json(await git.branch({ delete: body.delete, dir: body.dir ? normalizePath(body.dir) : undefined, list: body.list, name: body.name }));
+  }
+
+  private async handleGitCheckout(request: Request): Promise<Response> {
+    const body = gitCheckoutSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    return Response.json(
+      await git.checkout({ branch: body.branch, dir: body.dir ? normalizePath(body.dir) : undefined, force: body.force, ref: body.ref }),
+    );
+  }
+
+  private async handleGitPull(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), ref: z.string().optional(), remote: z.string().optional() }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
+    const config = await this.readAppConfig();
+    return Response.json(await git.pull({ author: defaultAuthor(config), dir, ref: body.ref, remote: body.remote, token }));
+  }
+
+  private async handleGitPush(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().optional(), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    try {
+      const token = await resolveRemoteToken({ dir, env: this.env, git, remote: body.remote, ownerEmail });
+      const result = await git.push({ dir, force: body.force, ref: body.ref, remote: body.remote, token });
+      if (!result.ok) {
+        const refErrors = Object.entries(result.refs ?? {})
+          .filter(([, v]) => !v.ok)
+          .map(([k, v]) => `${k}: ${v.error}`)
+          .join("; ");
+        return Response.json({ error: `Push failed: ${refErrors || "remote rejected the push"}`, refs: result.refs }, { status: 422 });
+      }
+      // Detect no-op pushes: ok=true but no refs changed
+      const refs = result.refs ?? {};
+      if (Object.keys(refs).length === 0) {
+        return Response.json({ error: "Push was a no-op — no refs were pushed. Verify you are on the correct branch and have committed changes.", refs }, { status: 422 });
+      }
+      if (body.ref) {
+        const verification = await verifyRemoteBranch({
+          baseRef: body.baseRef,
+          dir,
+          env: this.env,
+          expectedFiles: body.expectedFiles,
+          git,
+          ownerEmail,
+          ref: body.ref,
+          remote: body.remote,
+        });
+        if (!verification.ok) {
+          return Response.json({ error: verification.error ?? `Branch '${body.ref}' failed verification after push`, refs, verification }, { status: 422 });
+        }
+        return Response.json({ ...result, verification });
+      }
+      return Response.json(result);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("Could not find HEAD") || msg.includes("NotFoundError")) {
+        return Response.json({ error: "No git repository found. Run git_init to create one, or git_clone to clone an existing repo." }, { status: 400 });
+      }
+      if (msg.includes("remote") || msg.includes("getRemoteInfo")) {
+        return Response.json({ error: "No remote configured. Run git_clone to work with a remote repository, or add a remote with git_remote." }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  private async handleGitPushChecked(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), force: z.boolean().optional(), ref: z.string().min(1), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
+    return this.handleGitPush(new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  private async handleGitVerifyBranch(request: Request): Promise<Response> {
+    const body = z.object({ dir: z.string().optional(), ref: z.string().min(1), remote: z.string().optional(), baseRef: z.string().optional(), expectedFiles: z.array(z.string()).optional() }).strict().parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+    const verification = await verifyRemoteBranch({
+      baseRef: body.baseRef,
+      dir,
+      env: this.env,
+      expectedFiles: body.expectedFiles,
+      git,
+      ownerEmail,
+      ref: body.ref,
+      remote: body.remote,
+    });
+    if (!verification.ok) {
+      return Response.json(verification, { status: 422 });
+    }
+    return Response.json(verification);
+  }
+
+  private async handleGitRemote(request: Request): Promise<Response> {
+    const body = gitRemoteSchema.parse(await request.json());
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    return Response.json(
+      await git.remote({ add: body.add, dir, list: body.list, remove: body.remove }),
+    );
+  }
+
+  /**
+   * Push the workspace to a freshly-created GitHub repo. The MCP tool
+   * `publish_to_github` calls this after creating the repo via the GitHub API
+   * — by the time we get here the remote URL is real and we just need to
+   * configure a remote pointing at it and push.
+   *
+   * Distinct from `handleGitPush` because:
+   *  - It (re)writes the `github` remote idempotently — handy when the user
+   *    re-runs publish after fixing something.
+   *  - It defaults `ref` to the current branch (or `main`) so the agent
+   *    doesn't have to guess.
+   *  - It rejects an empty workspace with a clear message before issuing
+   *    a push that would just be a no-op.
+   */
+  private async handleGitPublishToGitHub(request: Request): Promise<Response> {
+    const body = z.object({
+      cloneUrl: z.string().url().describe("https://github.com/<owner>/<repo>.git"),
+      dir: z.string().optional(),
+      ref: z.string().optional(),
+      remoteName: z.string().optional(),
+    }).strict().parse(await request.json());
+
+    const git = createWorkspaceGit(this.workspace);
+    const dir = body.dir ? normalizePath(body.dir) : undefined;
+    const remoteName = body.remoteName ?? "github";
+    const ownerEmail = request.headers.get("x-owner-email") ?? this.readMetadata("owner_email") ?? undefined;
+
+    // Ensure the workspace is a git repo. If `flushTurnToArtifacts` already
+    // ran this turn, it is. Otherwise initialise it, mirroring the auto-init
+    // path in artifacts.ts so we never publish a repo with no history.
+    try {
+      await git.status({ dir });
+    } catch {
+      try {
+        await git.init({ defaultBranch: "main", dir });
+      } catch (err) {
+        return Response.json({ error: `Could not init workspace as a git repo: ${err instanceof Error ? err.message : String(err)}` }, { status: 400 });
+      }
+    }
+
+    // Resolve the branch to push. Prefer the explicit ref, then current
+    // branch, then fall back to `main` (which is what artifacts.ts uses).
+    let ref = body.ref;
+    if (!ref) {
+      try {
+        const branchInfo = await git.branch({ dir, list: true });
+        if (branchInfo && typeof branchInfo === "object" && "current" in branchInfo && typeof branchInfo.current === "string") {
+          ref = branchInfo.current;
+        }
+      } catch {
+        // Fall through — empty repos before the first commit have no branch.
+      }
+    }
+    ref = ref ?? "main";
+
+    // Refuse to publish a repo that has nothing to push. Without this check
+    // git.push silently succeeds with zero refs, the GitHub repo stays empty,
+    // and the user is left wondering why nothing happened.
+    try {
+      const log = await git.log({ depth: 1, dir, ref });
+      if (!Array.isArray(log) || log.length === 0) {
+        return Response.json({ error: `Branch '${ref}' has no commits. Stage and commit your work first (git_add + git_commit), then retry publish_to_github.` }, { status: 400 });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return Response.json({ error: `Branch '${ref}' has no commits or does not exist (${msg}). Stage and commit your work first.` }, { status: 400 });
+    }
+
+    // Configure the GitHub remote idempotently. `git.remote({ add })` errors
+    // if the remote already exists, so remove first if present.
+    try {
+      const remotes = (await git.remote({ dir, list: true })) as unknown as Array<{ remote: string; url: string }>;
+      if (Array.isArray(remotes) && remotes.some((r) => r.remote === remoteName)) {
+        await git.remote({ dir, remove: remoteName });
+      }
+      await git.remote({ dir, add: { name: remoteName, url: body.cloneUrl } });
+    } catch (err) {
+      return Response.json({ error: `Could not configure '${remoteName}' remote: ${err instanceof Error ? err.message : String(err)}` }, { status: 500 });
+    }
+
+    // Resolve the GitHub token via the standard remote-url-aware path. This
+    // honours per-user secrets first, then falls back to env (admin only) —
+    // identical policy to git_push and pr_create.
+    let token: string | undefined;
+    try {
+      token = await resolveRemoteToken({ dir, env: this.env, git, remote: remoteName, ownerEmail, url: body.cloneUrl });
+    } catch (err) {
+      return Response.json({ error: `Could not resolve GitHub token: ${err instanceof Error ? err.message : String(err)}` }, { status: 500 });
+    }
+    if (!token) {
+      return Response.json({ error: "No GitHub token available for the push. Add 'github_token' via the secrets UI." }, { status: 400 });
+    }
+
+    try {
+      const result = await git.push({ dir, ref, remote: remoteName, token });
+      if (!result.ok) {
+        const refErrors = Object.entries(result.refs ?? {})
+          .filter(([, v]) => !v.ok)
+          .map(([k, v]) => `${k}: ${v.error}`)
+          .join("; ");
+        return Response.json({ error: `Push to GitHub failed: ${refErrors || "remote rejected the push"}`, refs: result.refs }, { status: 422 });
+      }
+      const refs = result.refs ?? {};
+      if (Object.keys(refs).length === 0) {
+        return Response.json({ error: "Push was a no-op — no refs were pushed. The branch may already match the remote.", refs }, { status: 422 });
+      }
+      return Response.json({ ok: true, ref, remoteName, refs });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return Response.json({ error: `Push to GitHub failed: ${msg}` }, { status: 500 });
+    }
+  }
+
+  private async handleCreateCron(request: Request): Promise<Response> {
+    const body = cronCreateSchema.parse(await request.json());
+    let scheduled;
+    if (body.type === "delayed") {
+      scheduled = await this.schedule(body.delayInSeconds, "runCronPrompt", { description: body.description, prompt: body.prompt });
+    } else if (body.type === "scheduled") {
+      scheduled = await this.schedule(new Date(body.date), "runCronPrompt", { description: body.description, prompt: body.prompt });
+    } else if (body.type === "cron") {
+      scheduled = await this.schedule(body.cron, "runCronPrompt", { description: body.description, prompt: body.prompt });
+    } else {
+      scheduled = await this.scheduleEvery(body.intervalSeconds, "runCronPrompt", { description: body.description, prompt: body.prompt });
+    }
+
+    this.ctx.storage.sql.exec(
+      "INSERT INTO cron_jobs (schedule_id, description, prompt, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(schedule_id) DO UPDATE SET description = excluded.description, prompt = excluded.prompt",
+      scheduled.id,
+      body.description,
+      body.prompt,
+      nowEpoch(),
+    );
+
+    return Response.json(this.toCronJobRecord(scheduled, body.description, body.prompt), { status: 201 });
+  }
+
+  private async handleDeleteCron(scheduleId: string): Promise<Response> {
+    const id = decodeURIComponent(scheduleId);
+    await this.cancelSchedule(id);
+    this.ctx.storage.sql.exec("DELETE FROM cron_jobs WHERE schedule_id = ?", id);
+    return Response.json({ deleted: true, id });
+  }
+
+  // ─── Session watchdog ──────────────────────────────────────────────
+  //
+  // Each session can have at most one watchdog. The config lives in
+  // metadata under `watchdog_config` (JSON-encoded) and the recurring
+  // tick is registered as a cron schedule pointing at
+  // `runWatchdogCheck`. Counters (`watchdog_last_*`) are kept in
+  // metadata for observability. The schedule id is also stored so
+  // re-installs can cancel cleanly.
+
+  private async handleInstallWatchdog(request: Request): Promise<Response> {
+    let raw: unknown;
+    try {
+      raw = await request.json();
+    } catch {
+      return Response.json({ error: "Body must be JSON" }, { status: 400 });
+    }
+    let config: WatchdogConfig;
+    try {
+      config = normaliseWatchdogConfig(raw);
+    } catch (err) {
+      return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 400 });
+    }
+
+    // Cancel any existing watchdog schedule before installing the new one.
+    const prevScheduleId = this.watchdogStore.readScheduleId();
+    if (prevScheduleId) {
+      try { await this.cancelSchedule(prevScheduleId); } catch { /* no-op */ }
+    }
+
+    const scheduled = await this.schedule(config.checkCron, "runWatchdogCheck", {});
+    this.watchdogStore.install(config, scheduled.id);
+    return Response.json(this.watchdogStore.read(), { status: 201 });
+  }
+
+  private async handleDeleteWatchdog(): Promise<Response> {
+    const scheduleId = this.watchdogStore.readScheduleId();
+    if (scheduleId) {
+      try { await this.cancelSchedule(scheduleId); } catch { /* no-op */ }
+    }
+    this.watchdogStore.uninstall();
+    return Response.json({ deleted: true });
+  }
+
+  /** Recurring watchdog tick. Runs at the configured cron cadence;
+   *  reads current session state, decides whether to act, and either
+   *  notifies, aborts, or nudges. Safe to call when no watchdog is
+   *  installed — it just no-ops. */
+  async runWatchdogCheck(): Promise<void> {
+    const config = this.watchdogStore.readConfig();
+    if (!config) return;
+
+    const now = nowEpoch();
+    this.watchdogStore.recordChecked(now);
+
+    // Resolve last-activity timestamp. `updated_at` is stamped on every
+    // metadata write — we parse the ISO string back to epoch seconds.
+    const snapshot = this.control.read();
+    const updatedAtEpoch = snapshot.updatedAt
+      ? Math.floor(Date.parse(snapshot.updatedAt) / 1000)
+      : null;
+
+    const verdict = evaluateSession(
+      {
+        status: snapshot.status,
+        activePromptId: snapshot.activePromptId,
+        lastActivityAt: updatedAtEpoch ?? 0,
+        lastFiredForPromptId: this.watchdogStore.readLastFiredForPromptId(),
+        config,
+      },
+      now * 1000,
+    );
+    if (verdict.kind !== "stalled") return;
+
+    const sessionId = snapshot.sessionId ?? "unknown";
+    const title = snapshot.title ?? sessionId;
+    const ownerEmail = snapshot.ownerEmail ?? undefined;
+
+    // Record fire BEFORE taking action so a retry of this same tick
+    // (alarm replay) won't double-fire.
+    this.watchdogStore.recordFired(verdict.activePromptId, now);
+
+    const body = formatStallBody(sessionId, verdict, config.action);
+
+    if (verdict.recommend === "abort" || verdict.recommend === "nudge") {
+      try {
+        await this.handleAbort();
+      } catch (err) {
+        // Abort failures are non-fatal — fall through to the notification
+        // so the user finds out something went wrong.
+        log("warn", "watchdog: abort failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    if (verdict.recommend === "nudge") {
+      const nudge = config.nudgePrompt ?? DEFAULT_NUDGE_PROMPT;
+      try {
+        await this.lifecycle.start({ source: "watchdog", content: nudge });
+      } catch (err) {
+        log("warn", "watchdog: nudge dispatch failed", { sessionId, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    dispatchNotification(this.env, this.ctx, {
+      kind: "watchdog-stalled",
+      title: `Dodo: ${title} (stalled)`,
+      body,
+      tags: "warning,robot",
+      priority: "high",
+      ownerEmail,
+    });
+
+    // Live UI update — emit on the per-session SSE channel so the
+    // watchdog panel can refresh without polling.
+    this.emitEvent({
+      data: {
+        action: config.action,
+        stallSeconds: verdict.stallSeconds,
+        activePromptId: verdict.activePromptId,
+        firedAt: now,
+      },
+      type: "watchdog_fired",
+    });
+  }
+
+  async runCronPrompt(payload: { description: string; prompt: string }): Promise<void> {
+    // Pre-derive title from description when no title is set yet — cron
+    // is invoked from a schedule callback, not a user, so we want the
+    // schedule's description in the UI rather than a content-derived snippet.
+    if (!this.control.readTitle()) {
+      this.control.setTitle(payload.description);
+    }
+    await this.lifecycle.start({ source: "cron", content: payload.prompt });
+  }
+
+  private listCronJobs(): CronJobRecord[] {
+    return Array.from(this.ctx.storage.sql.exec("SELECT schedule_id, description, prompt, created_at FROM cron_jobs ORDER BY created_at DESC")).map((row) => {
+      const schedule = this.getSchedule<{ description: string; prompt: string }>(String(row.schedule_id));
+      return this.toCronJobRecord(schedule, String(row.description), String(row.prompt), Number(row.created_at));
+    });
+  }
+
+  private toCronJobRecord(
+    schedule: ReturnType<CodingAgent["getSchedule"]>,
+    description: string,
+    prompt: string,
+    createdAt = nowEpoch(),
+  ): CronJobRecord {
+    return {
+      callback: schedule?.callback ?? "runCronPrompt",
+      createdAt: epochToIso(createdAt),
+      description,
+      id: schedule?.id ?? "missing",
+      nextRunAt: schedule ? epochToIso(schedule.time) : null,
+      payload: prompt,
+      scheduleType: schedule?.type ?? "scheduled",
+    };
+  }
+
+  private async exportSnapshot(): Promise<SessionSnapshot | SnapshotV2> {
+    const paths = await this.workspace._getAllPaths();
+    const files: Array<{ content: string; path: string; encoding?: "base64" }> = [];
+
+    for (const path of paths) {
+      const stat = await this.workspace.stat(path);
+      if (!stat || stat.type !== "file") {
+        continue;
+      }
+      // Binary files (git internals) must be base64-encoded to survive JSON round-trip
+      const isBinary = path.startsWith("/.git/") || path.includes("/.git/");
+      if (isBinary) {
+        const bytes = await this.workspace.readFileBytes(path);
+        if (bytes !== null) {
+          // Convert Uint8Array to base64 in chunks. The spread form
+          // (`String.fromCharCode(...bytes)`) blows the call stack on git
+          // pack files >~64 KB, which any non-trivial clone produces, and
+          // aborts the snapshot export. (audit finding H9)
+          files.push({ content: bytesToBase64Chunked(bytes), path, encoding: "base64" });
+        }
+      } else {
+        const content = await this.workspace.readFile(path);
+        if (content !== null) {
+          files.push({ content, path });
+        }
+      }
+    }
+
+    // V2 snapshot: Think messages + sidecar metadata
+    const thinkSessionId = this.getCurrentSessionId();
+    const history = thinkSessionId ? this.sessions.getHistory(thinkSessionId) : [];
+    return {
+      version: 2,
+      title: this.readMetadata("title"),
+      files,
+      messages: history.map((msg) => {
+        const meta = this.readMessageMetadata(msg.id);
+        return {
+          uiMessage: msg,
+          metadata: {
+            authorEmail: meta?.authorEmail,
+            model: meta?.model,
+            provider: meta?.provider,
+            tokenInput: meta?.tokenInput ?? 0,
+            tokenOutput: meta?.tokenOutput ?? 0,
+          },
+        };
+      }),
+    } satisfies SnapshotV2;
+  }
+
+  private async handleImportSnapshot(request: Request): Promise<Response> {
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(this.requireSessionId(request), ownerEmail);
+    const url = new URL(request.url);
+    let snapshotInput: unknown;
+    const snapshotId = url.searchParams.get("snapshotId");
+    if (snapshotId) {
+      if (!ownerEmail) {
+        throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
+      }
+      const stub = getUserControlStub(this.env, ownerEmail);
+      const response = await stub.fetch(`https://user-control/fork-snapshots/${encodeURIComponent(snapshotId)}`);
+      snapshotInput = await response.json();
+    } else {
+      snapshotInput = await request.json();
+    }
+
+    const raw = snapshotInput as Record<string, unknown>;
+    const version = typeof raw.version === "number" ? raw.version : 1;
+
+    if (version === 2) {
+      // V2 import: UIMessages + sidecar metadata → Think session
+      const v2 = snapshotInput as SnapshotV2;
+      if (v2.title) this.writeMetadata("title", v2.title);
+      for (const file of v2.files) {
+        const normalized = normalizePath(file.path);
+        if ((file as { encoding?: string }).encoding === "base64") {
+          // Decode base64 back to binary
+          const binary = atob(file.content);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          await this.workspace.writeFileBytes(normalized, bytes);
+        } else {
+          await this.workspace.writeFile(normalized, file.content);
+        }
+      }
+      const thinkSessionId = this.getCurrentSessionId();
+      if (thinkSessionId) {
+        for (const entry of v2.messages) {
+          this.sessions.append(thinkSessionId, entry.uiMessage);
+          this.insertMessageMetadata({
+            messageId: entry.uiMessage.id,
+            authorEmail: entry.metadata.authorEmail,
+            model: entry.metadata.model,
+            provider: entry.metadata.provider,
+            tokenInput: entry.metadata.tokenInput,
+            tokenOutput: entry.metadata.tokenOutput,
+          });
+        }
+        this.messages = this.sessions.getHistory(thinkSessionId);
+      }
+
+      return Response.json({ imported: true, version: 2, messages: v2.messages.length, files: v2.files.length });
+    }
+
+    // V1 import: flat ChatMessageRecord[] → Think session
+    const snapshot = z.object({ files: z.array(z.object({ content: z.string(), path: z.string().min(1) })), messages: z.array(z.object({ content: z.string(), createdAt: z.string(), id: z.string(), model: z.string().nullable(), provider: z.string().nullable(), role: z.enum(["assistant", "system", "tool", "user"]) })), title: z.string().nullable() }).parse(snapshotInput) as SessionSnapshot;
+
+    if (snapshot.title) {
+      this.writeMetadata("title", snapshot.title);
+    }
+
+    for (const file of snapshot.files) {
+      const normalized = normalizePath(file.path);
+      if ((file as { encoding?: string }).encoding === "base64") {
+        const binary = atob(file.content);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        await this.workspace.writeFileBytes(normalized, bytes);
+      } else {
+        await this.workspace.writeFile(normalized, file.content);
+      }
+    }
+
+    // Import into Think session
+    const thinkSessionId = this.getCurrentSessionId();
+    if (thinkSessionId) {
+      for (const message of snapshot.messages) {
+        const uiMsg = chatRecordToUIMessage(message);
+        this.sessions.append(thinkSessionId, uiMsg);
+        this.insertMessageMetadata({
+          messageId: uiMsg.id,
+          authorEmail: message.authorEmail,
+          model: message.model,
+          provider: message.provider,
+          tokenInput: message.tokenInput,
+          tokenOutput: message.tokenOutput,
+        });
+      }
+      this.messages = this.sessions.getHistory(thinkSessionId);
+    }
+
+    return Response.json({ imported: true, messages: snapshot.messages.length, files: snapshot.files.length });
+  }
+
+  private async handleMessage(request: Request): Promise<Response> {
+    const input = sendMessageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
+    this.ensureMetadata(sessionId, ownerEmail);
+
+    // Server-side slash command routing so /generate works from every entry
+    // point (browser UI, MCP tools, webhooks) — not just the client JS. We do
+    // this before the active-prompt check because `runImageGeneration` has its
+    // own 409 handling for that case.
+    const imagePrompt = extractGeneratePrompt(input.content);
+    if (imagePrompt) {
+      this.ensureThinkConfig(request);
+      return this.runImageGeneration({
+        prompt: imagePrompt,
+        sessionId,
+        authorEmail,
+        ownerEmail,
+      });
+    }
+
+    // handleMessage is synchronous — callers (MCP, external integrations) expect the
+    // assistant response in the HTTP reply. Queuing would lose the response. Keep 409.
+    // This is the only path that doesn't go through SessionLifecycle (sync semantics
+    // mean we don't spawn a fiber); status/title management is done by hand using the
+    // typed control plane.
+    if (this.control.readActivePromptId()) {
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
+    }
+
+    const existingTitle = this.control.readTitle();
+    const title = existingTitle ?? (input.content.length > 72 ? input.content.slice(0, 72) + "…" : input.content);
+    if (!existingTitle) this.control.setTitle(title);
+    this.control.setStatus("running");
+    await this.syncSessionIndex({ status: "running", title });
+
+    const notifyOwner = this.control.readOwnerEmail() ?? undefined;
+
+    this.ensureThinkConfig(request);
+    await this.readAppConfig();
+    try {
+      const result = await this.runThinkChat(input.content, { authorEmail: authorEmail ?? undefined, images: input.images });
+
+      // Guard: treat empty LLM response as a failure (same as runFiberPrompt)
+      if (!result.text && !result.assistantMessageId) {
+        const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
+        this.control.setStatus("idle");
+        await this.syncSessionIndex({ status: "idle", title });
+        this.emitEvent({ data: { message }, type: "error_message" });
+        this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+        dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
+        return Response.json({ error: message, sessionId }, { status: 502 });
+      }
+
+      const config = this.getConfig();
+      const assistantRecord = uiMessageToChatRecord(
+        { id: result.assistantMessageId, role: "assistant", parts: [{ type: "text", text: result.text }] },
+        { messageId: result.assistantMessageId, model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: result.tokenInput, tokenOutput: result.tokenOutput, authorEmail: null, createdAt: nowEpoch() },
+      );
+
+      this.control.setStatus("idle");
+      await this.syncSessionIndex({ status: "idle", title });
+      this.emitEvent({ data: assistantRecord, type: "message" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-complete", title: `Dodo: ${title}`, body: result.text.slice(0, 200), tags: "white_check_mark,robot", ownerEmail: notifyOwner });
+
+      return Response.json({ gateway: config?.activeGateway ?? "opencode", message: assistantRecord, sessionId, steps: 0, toolCalls: [] });
+    } catch (error) {
+      this.control.setStatus("idle");
+      await this.syncSessionIndex({ status: "idle", title });
+      const message = error instanceof Error ? error.message : "Unknown LLM failure";
+      this.emitEvent({ data: { message }, type: "error_message" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      dispatchNotification(this.env, this.ctx, { kind: "prompt-error", title: `Dodo: ${title} (failed)`, body: message, tags: "x,robot", priority: "high", ownerEmail: notifyOwner });
+      return Response.json({ error: message, sessionId }, { status: 502 });
+    }
+  }
+
+  private async handlePrompt(request: Request): Promise<Response> {
+    const input = sendMessageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.mcpDepth = parseInt(request.headers.get("x-dodo-mcp-depth") ?? "0", 10) || 0;
+    this.ensureMetadata(sessionId, ownerEmail);
+    this.ensureThinkConfig(request);
+
+    // Server-side slash routing — /generate works the same whether it comes
+    // from the browser UI, an MCP `send_prompt` call, a webhook, etc. Image
+    // uploads alongside /generate are ignored (FLUX-1-schnell is text-to-image
+    // only; multi-reference inputs are FLUX.2).
+    const imagePrompt = extractGeneratePrompt(input.content);
+    if (imagePrompt) {
+      return this.runImageGeneration({
+        prompt: imagePrompt,
+        sessionId,
+        authorEmail,
+        ownerEmail,
+      });
+    }
+
+    const r = await this.lifecycle.start({
+      source: "user",
+      content: input.content,
+      authorEmail,
+      images: input.images,
+    });
+    if (r.kind === "rejected") {
+      return Response.json({ error: r.message }, { status: 400 });
+    }
+    if (r.kind === "queued") {
+      return Response.json({ status: "queued", promptId: r.promptId, position: r.position }, { status: 202 });
+    }
+    if (r.kind === "skipped") {
+      // Shouldn't happen for source=user, but be defensive.
+      return Response.json({ status: "skipped" }, { status: 409 });
+    }
+    return Response.json({ promptId: r.promptId, status: "queued" }, { status: 202 });
+  }
+
+  private async handleGenerate(request: Request): Promise<Response> {
+    const input = generateImageSchema.parse(await request.json());
+    const sessionId = this.requireSessionId(request);
+    const authorEmail = request.headers.get("x-author-email");
+    const ownerEmail = request.headers.get("x-owner-email");
+    this.ensureMetadata(sessionId, ownerEmail);
+    this.ensureThinkConfig(request);
+    return this.runImageGeneration({
+      prompt: input.content,
+      sessionId,
+      authorEmail,
+      ownerEmail,
+    });
+  }
+
+  /** Shared image-generation core. Invoked by `handleGenerate` (dedicated
+   *  endpoint) and by `handleMessage`/`handlePrompt` when they detect a
+   *  `/generate` slash command in the chat content. Returns a Response so
+   *  callers can bubble errors and status codes without double-wrapping. */
+  private async runImageGeneration(opts: {
+    prompt: string;
+    sessionId: string;
+    authorEmail: string | null;
+    ownerEmail: string | null;
+  }): Promise<Response> {
+    if (opts.prompt.length > FLUX_MAX_PROMPT_LENGTH) {
+      return Response.json({ error: `Prompt exceeds ${FLUX_MAX_PROMPT_LENGTH} characters` }, { status: 400 });
+    }
+
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) {
+      return Response.json({ error: "No Think session" }, { status: 500 });
+    }
+
+    // Start a synchronous prompt via lifecycle. image-gen's policy rejects
+    // when busy (matches the pre-refactor 409 behaviour) and uses
+    // synchronous=true so no fiber is spawned — we run inline below.
+    const startResult = await this.lifecycle.start({
+      source: "image-gen",
+      content: opts.prompt,
+      authorEmail: opts.authorEmail,
+    });
+    if (startResult.kind === "rejected") {
+      return Response.json({ error: "A prompt is already running" }, { status: 409 });
+    }
+    if (startResult.kind !== "started") {
+      // Shouldn't be reachable for source=image-gen, but be safe.
+      return Response.json({ error: "Unable to start image generation" }, { status: 500 });
+    }
+    const promptId = startResult.promptId;
+
+    try {
+      // 1. Persist user prompt message
+      const userMsgId = this.persistGenerateUserMessage(thinkSessionId, opts.prompt, opts.authorEmail);
+
+      // 2. Generate image via Workers AI. Pass a random seed so repeat
+      //    invocations of the same prompt don't collapse to identical output.
+      const raw = await this.env.AI.run(FLUX_IMAGE_MODEL, {
+        prompt: opts.prompt,
+        seed: Math.floor(Math.random() * 1_000_000),
+      });
+      // Defensive parsing — type assertions would silently break if the
+      // Workers AI response shape ever drifts (it already has for FLUX.2).
+      if (!raw || typeof raw !== "object" || typeof (raw as { image?: unknown }).image !== "string" || !(raw as { image: string }).image) {
+        throw new Error("FLUX returned unexpected response shape");
+      }
+      const imageData = (raw as { image: string }).image;
+
+      // 3. Persist assistant message with the generated image
+      const assistantResult = await this.persistGeneratedImageMessage({
+        thinkSessionId,
+        sessionId: opts.sessionId,
+        prompt: opts.prompt,
+        imageData,
+        ownerEmail: opts.ownerEmail ?? undefined,
+      });
+
+      await this.finishPrompt(promptId, { resultMessageId: assistantResult.messageId, status: "completed" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+
+      return Response.json({
+        message: assistantResult.record,
+        promptId,
+        status: "completed",
+        userMsgId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Image generation failed";
+      this.emitEvent({ data: { message }, type: "error_message" });
+      await this.finishPrompt(promptId, { error: message, status: "failed" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      return Response.json({ error: message }, { status: 502 });
+    }
+  }
+
+  /** Persist the user's /generate prompt as a regular text message and emit a
+   *  `message` SSE event so the UI renders it identically to a chat prompt. */
+  private persistGenerateUserMessage(thinkSessionId: string, content: string, authorEmail: string | null): string {
+    const userMsgId = crypto.randomUUID();
+    const userMsg: UIMessage = {
+      id: userMsgId,
+      role: "user",
+      parts: [{ type: "text", text: content }],
+    };
+    this.sessions.append(thinkSessionId, userMsg);
+    this.insertMessageMetadata({
+      messageId: userMsgId,
+      authorEmail: authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+    });
+    const userRecord = uiMessageToChatRecord(userMsg, {
+      messageId: userMsgId,
+      authorEmail: authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+    this.emitEvent({ data: userRecord, type: "message" });
+    return userMsgId;
+  }
+
+  /** Upload the FLUX-generated image to R2 and persist it as an assistant
+   *  message. If R2 is unavailable the message falls back to an inline data
+   *  URL so the user still sees the image rather than a silent stub — this
+   *  matches the design contract in `src/attachments.ts`. */
+  private async persistGeneratedImageMessage(opts: {
+    thinkSessionId: string;
+    sessionId: string;
+    prompt: string;
+    imageData: string;
+    ownerEmail: string | undefined;
+  }): Promise<{ messageId: string; record: ChatMessageRecord }> {
+    const assistantMsgId = crypto.randomUUID();
+    const mediaType = FLUX_IMAGE_MEDIA_TYPE;
+
+    const attachmentRef = await uploadAttachment(this.env, {
+      sessionId: opts.sessionId,
+      messageId: assistantMsgId,
+      mediaType,
+      data: opts.imageData,
+      source: "assistant",
+      ownerEmail: opts.ownerEmail,
+    });
+
+    // Short, non-verbose caption — the image carries the meaning. Truncate the
+    // prompt so a 2000-char prompt doesn't dominate the bubble.
+    const preview = opts.prompt.length > 80 ? `${opts.prompt.slice(0, 80).trimEnd()}…` : opts.prompt;
+    const assistantParts: UIMessage["parts"] = [
+      { type: "text", text: `🎨 ${preview}` },
+    ];
+    // Prefer the R2-backed URL; fall back to an inline data URL when R2 is
+    // unavailable so the UI still renders something useful in local dev.
+    const imageUrl = attachmentRef?.url ?? `data:${mediaType};base64,${opts.imageData}`;
+    assistantParts.push({
+      type: "file",
+      mediaType,
+      url: imageUrl,
+    } as FileUIPart);
+
+    const assistantMsg: UIMessage = {
+      id: assistantMsgId,
+      role: "assistant",
+      parts: assistantParts,
+    };
+    this.sessions.append(opts.thinkSessionId, assistantMsg);
+    this.insertMessageMetadata({
+      messageId: assistantMsgId,
+      authorEmail: null,
+      model: FLUX_IMAGE_MODEL,
+      provider: "Workers AI",
+      tokenInput: 0,
+      tokenOutput: 0,
+    });
+
+    if (attachmentRef) {
+      this.insertMessageAttachment({
+        messageId: assistantMsgId,
+        mediaType,
+        url: attachmentRef.url,
+        size: attachmentRef.size,
+        source: "assistant",
+      });
+    } else {
+      log("warn", "persistGeneratedImageMessage: R2 unavailable, falling back to inline data URL", {
+        sessionId: opts.sessionId,
+      });
+    }
+
+    const record = uiMessageToChatRecord(assistantMsg, {
+      messageId: assistantMsgId,
+      authorEmail: null,
+      model: FLUX_IMAGE_MODEL,
+      provider: "Workers AI",
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+
+    this.emitEvent({ data: record, type: "message" });
+    if (attachmentRef) {
+      this.emitEvent({
+        data: {
+          messageId: assistantMsgId,
+          attachments: rewriteAttachmentsForClient([
+            { mediaType: attachmentRef.mediaType, url: attachmentRef.url, size: attachmentRef.size },
+          ]),
+        },
+        type: "message_attachments",
+      });
+    }
+
+    return { messageId: assistantMsgId, record };
+  }
+
+  private async handleAbort(): Promise<Response> {
+    const r = await this.lifecycle.abortActive();
+    if (r.kind === "noop") {
+      return Response.json({ error: "No active prompt" }, { status: 409 });
+    }
+    return Response.json({ aborted: true, promptId: r.promptId });
+  }
+
+  // runAsyncPrompt removed — all async prompts now use fiber-backed runFiberPrompt
+
+  /**
+   * Legacy thin wrapper kept so call sites in runFiberPrompt /
+   * runImageGeneration / onFiberComplete still compile. New code should
+   * call `this.lifecycle.finish(...)` directly with a typed FinishCause.
+   */
+  private async finishPrompt(
+    promptId: string,
+    patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"]; text?: string },
+  ): Promise<void> {
+    if (patch.status === "completed") {
+      await this.lifecycle.finish(promptId, {
+        kind: "completed",
+        resultMessageId: patch.resultMessageId,
+        text: patch.text,
+      });
+    } else if (patch.status === "failed") {
+      await this.lifecycle.finish(promptId, {
+        kind: "failed",
+        error: patch.error ?? "Prompt failed",
+      });
+    } else {
+      await this.lifecycle.finish(promptId, {
+        kind: "aborted",
+        reason: patch.error,
+      });
+    }
+  }
+
+  // ─── Prompt queue management ───
+  //
+  // Enqueueing is now done inside SessionLifecycle via the PromptRepo
+  // port (see the prompts.enqueue closure in the constructor). The queue
+  // can only be entered through lifecycle.start({source:"user"}) when a
+  // prompt is busy. drainOneQueuedPrompt() (above) handles the recovery
+  // case where the DO evicts mid-finish.
+
+  private readQueueState(): { queue: Array<{ id: string; content: string; position: number; createdAt: string }> } {
+    const rows = Array.from(this.ctx.storage.sql.exec("SELECT id, content, position, created_at FROM prompt_queue ORDER BY position ASC"));
+    return {
+      queue: rows.map((r) => ({
+        id: String(r.id),
+        content: String(r.content),
+        position: Number(r.position),
+        createdAt: epochToIso(r.created_at),
+      })),
+    };
+  }
+
+  // ─── Fiber-aware prompt execution ───
+
+  /**
+   * Fiber-aware async prompt. Uses stashFiber() checkpoints so that
+   * if the DO is evicted mid-chat, recovery replays from the top and
+   * skips already-completed work.
+   */
+  async runFiberPrompt(payload: { promptId: string; content: string; images?: Array<{ data: string; mediaType: string }>; authorEmail?: string; title: string }): Promise<void> {
+    const { promptId, content, images, authorEmail, title } = payload;
+
+    // If the prompt was aborted (or otherwise finished) before the fiber
+    // started, don't run it. Without this guard, an abort that fires
+    // before the fiber wakes up gets overwritten by the fiber's later
+    // "completed" finalization — a stale "aborted" status flips back to
+    // "completed" once the slow LLM call returns. This is the same class
+    // of race that the `if (signal.aborted) return` guard in the catch
+    // block protects against, but at the start of the fiber instead of
+    // the end.
+    const promptStatusRow = (Array.from(this.ctx.storage.sql.exec("SELECT status FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+    const promptStatus = promptStatusRow ? String(promptStatusRow.status) : null;
+    if (promptStatus && promptStatus !== "queued" && promptStatus !== "running") {
+      return;
+    }
+
+    // Refresh Think config from the latest account config before each prompt run.
+    await this.readAppConfig();
+
+    // Check fiber snapshot — if chat already completed, skip to finalization
+    const fiberId = this.readPromptFiberId(promptId);
+    if (fiberId) {
+      const fiber = this.getFiber(fiberId);
+      const snapshot = fiber?.snapshot as { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number } | null;
+      if (snapshot?.chatCompleted) {
+        // Chat completed before eviction — just finalize
+        await this.finalizePromptFromFiber(promptId, title, snapshot);
+        return;
+      }
+    }
+
+    // Phase 1: Run chat via Think
+    // Create an AbortController so handleAbort() can interrupt the running LLM call
+    this._fiberAbortController = new AbortController();
+    const signal = this._fiberAbortController.signal;
+    try {
+      const result = await this.runThinkChat(content, { authorEmail, signal, images });
+
+      // Guard: treat empty LLM response as a failure — UNLESS the prompt
+      // was aborted, in which case the empty result is expected and
+      // `handleAbort` has already marked the prompt as `aborted`.
+      // (Without this guard, an abort racing the LLM would clobber the
+      // abort handler's status with `failed` because Think.chat swallows
+      // AbortError into onError() rather than rethrowing — so the catch
+      // block at the bottom of this try never fires for abort cases.)
+      if (!result.text && !result.assistantMessageId) {
+        if (signal.aborted) return;
+        const message = "LLM returned an empty response — the model may be unavailable or the request was rejected. Try again or switch models.";
+        this.emitEvent({ data: { message }, type: "error_message" });
+        // lifecycle.finish dispatches the prompt-error notification per policy
+        await this.finishPrompt(promptId, { error: message, status: "failed" });
+        return;
+      }
+
+      // Final-check: if the prompt was aborted while we were in flight
+      // (signal.aborted) or while the catch block was skipped (Think
+      // swallows AbortError without rethrowing in some paths), don't
+      // overwrite the "aborted" status with "completed". Also reread the
+      // DB status so we cover the case where abort fired BEFORE we
+      // registered the AbortController (signal would not have flipped).
+      if (signal.aborted) return;
+      const currentStatusRow = (Array.from(this.ctx.storage.sql.exec("SELECT status FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+      const currentStatus = currentStatusRow ? String(currentStatusRow.status) : null;
+      if (currentStatus && currentStatus !== "queued" && currentStatus !== "running") {
+        return;
+      }
+
+      // Phase 2: Checkpoint immediately after chat completes
+      this.stashFiber({
+        chatCompleted: true,
+        assistantMessageId: result.assistantMessageId,
+        text: result.text,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
+      });
+
+      // Phase 3: Finalize
+      await this.finalizePromptFromFiber(promptId, title, {
+        chatCompleted: true,
+        assistantMessageId: result.assistantMessageId,
+        text: result.text,
+        tokenInput: result.tokenInput,
+        tokenOutput: result.tokenOutput,
+      });
+    } catch (error) {
+      // Don't report abort-caused errors as failures — the abort handler already
+      // marked the prompt as aborted.
+      if (signal.aborted) return;
+      const message = error instanceof Error ? error.message : "Prompt failed";
+      this.emitEvent({ data: { message }, type: "error_message" });
+      // lifecycle.finish dispatches the prompt-error notification per policy
+      await this.finishPrompt(promptId, { error: message, status: "failed" });
+    } finally {
+      this._fiberAbortController = null;
+      await this.syncSessionIndex({ status: "idle", title });
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    }
+  }
+
+  /**
+   * Finalize a prompt from fiber snapshot data. Emits the assistant
+   * message event (cosmetic — UI uses it for live updates) then routes
+   * state cleanup, completion notification, dequeue, and goal
+   * auto-continue through the SessionLifecycle.
+   */
+  private async finalizePromptFromFiber(
+    promptId: string,
+    title: string,
+    snapshot: { chatCompleted?: boolean; assistantMessageId?: string; text?: string; tokenInput?: number; tokenOutput?: number },
+  ): Promise<void> {
+    void title; // emitted by lifecycle.finish via control.read().title
+    const config = this.getConfig();
+    const text = snapshot.text ?? "";
+    const assistantRecord = uiMessageToChatRecord(
+      { id: snapshot.assistantMessageId ?? "", role: "assistant", parts: [{ type: "text", text }] },
+      { messageId: snapshot.assistantMessageId ?? "", model: config?.model ?? null, provider: config?.activeGateway ?? null, tokenInput: snapshot.tokenInput ?? 0, tokenOutput: snapshot.tokenOutput ?? 0, authorEmail: null, createdAt: nowEpoch() },
+    );
+
+    this.emitEvent({ data: assistantRecord, type: "message" });
+    await this.lifecycle.finish(promptId, {
+      kind: "completed",
+      resultMessageId: snapshot.assistantMessageId,
+      text,
+      tokenInput: snapshot.tokenInput,
+      tokenOutput: snapshot.tokenOutput,
+    });
+
+    // Chat-monitor brain post-turn check: if this is a chat-monitor brain
+    // and the just-completed turn didn't call chat_reply (or chat_no_reply),
+    // the human in chat never heard back. Fire a one-shot nudge prompt to
+    // remind the model. Bounded retries via session metadata to prevent
+    // infinite loops if the model is genuinely stuck.
+    await this.maybeNudgeChatMonitorBrain().catch((err) => {
+      log("warn", "chat-monitor nudge check failed (non-fatal)", {
+        sessionId: this.sessionId(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  /**
+   * Post-turn validator for chat-monitor brain sessions. Reads the
+   * per-turn tool-call set captured by runThinkChat — if `chat_reply`
+   * wasn't called, the human in the Google Chat space got nothing.
+   * Enqueues a follow-up prompt (capped at MAX_BRAIN_NUDGES retries via
+   * session metadata) so the model can recover from a one-off
+   * tool-calling miss.
+   *
+   * Safe to no-op when the session isn't a chat-monitor brain.
+   */
+  private async maybeNudgeChatMonitorBrain(): Promise<void> {
+    if (this.readMetadata("is_chat_monitor_brain") !== "true") return;
+    // MCP-mediated tools are namespaced by the gatekeeper as
+    // `${configId}__${toolName}` (see HttpMcpClient.listTools). So
+    // chat_reply appears as e.g. `82ed5670-...-cdd__chat_reply` in the
+    // _toolCallNames set. Match by suffix to cover any future mcp-config
+    // id shuffling. Built-in (non-MCP) tools would appear unprefixed,
+    // so check both shapes.
+    const calledChatReply = Array.from(this._toolCallNames).some((n) =>
+      n === "chat_reply" || n.endsWith("__chat_reply"),
+    );
+    if (calledChatReply) {
+      // Replied successfully — reset retry counter for the next turn.
+      this.writeMetadata("brain_nudge_count", "0");
+      return;
+    }
+    const MAX_BRAIN_NUDGES = 2;
+    const prior = parseInt(this.readMetadata("brain_nudge_count") || "0", 10) || 0;
+    if (prior >= MAX_BRAIN_NUDGES) {
+      log("warn", "chat-monitor brain exhausted nudge budget without calling chat_reply", {
+        sessionId: this.sessionId(),
+        nudges: prior,
+      });
+      this.writeMetadata("brain_nudge_count", "0");
+      return;
+    }
+    this.writeMetadata("brain_nudge_count", String(prior + 1));
+    log("info", "chat-monitor brain didn't call chat_reply — nudging", {
+      sessionId: this.sessionId(),
+      attempt: prior + 1,
+    });
+    const ownerEmail = this.readMetadata("owner_email") ?? undefined;
+    await this.lifecycle.start({
+      source: "user",
+      content:
+        `[System nudge — not from a human in chat]\n\n` +
+        `Your previous turn ended without calling the \`chat_reply\` MCP tool. ` +
+        `The human in the Google Chat space heard nothing. ` +
+        `If your previous answer was meant for them, send it now via \`chat_reply\` ` +
+        `(remember to pass your own sessionId). ` +
+        `If the previous message genuinely warranted no reply (e.g. it was idle ` +
+        `chatter not directed at you, or this is a confirmation to yourself ` +
+        `that you've already replied), call \`chat_reply\` with text="<NO_REPLY>" ` +
+        `(EXACT literal — that string is the tombstone the system recognises). ` +
+        `Do not type prose explaining what you did — call the tool. ` +
+        `This is your reminder ${prior + 1} of ${MAX_BRAIN_NUDGES}.`,
+      authorEmail: ownerEmail,
+    });
+  }
+
+  /** Called by the set_goal_status tool from inside agentic.ts. */
+  declareGoalTerminal(status: "done" | "blocked" | "needs_input", summary: string): GoalState {
+    const state = this.updateGoalStatus(status, summary);
+    if (status === "needs_input") {
+      // Wake the owner — they need to come back and answer.
+      dispatchNotification(this.env, this.ctx, {
+        kind: "prompt-complete",
+        title: `Dodo: needs your input`,
+        body: summary.slice(0, 200),
+        tags: "question,robot",
+        priority: "high",
+        ownerEmail: this.readMetadata("owner_email") ?? undefined,
+      });
+    }
+    return state;
+  }
+
+  /** Read the fiber_id from a prompt row. */
+  private readPromptFiberId(promptId: string): string | null {
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT fiber_id FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+    return row?.fiber_id ? String(row.fiber_id) : null;
+  }
+
+  /** Store a fiber_id on a prompt row. */
+  private setPromptFiberId(promptId: string, fiberId: string): void {
+    this.ctx.storage.sql.exec("UPDATE prompts SET fiber_id = ? WHERE id = ?", fiberId, promptId);
+  }
+
+  /**
+   * Called when a fiber recovers after DO eviction.
+   * Updates the prompt status to "recovering" and emits an event.
+   */
+  async onFiberRecovered(ctx: FiberRecoveryContext): Promise<void> {
+    // Find the prompt associated with this fiber
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id FROM prompts WHERE fiber_id = ?", ctx.id))[0] as SqlRow | null);
+    if (row) {
+      const promptId = String(row.id);
+      this.updatePrompt(promptId, { status: "running" });
+      this.writeMetadata("active_prompt_id", promptId);
+      this.writeMetadata("status", "running");
+      this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+      this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+    }
+
+    // Default behavior: restart the fiber
+    this.restartFiber(ctx.id);
+  }
+
+  /**
+   * Called when a fiber completes (success, failure, or cancellation).
+   */
+  async onFiberComplete(ctx: FiberCompleteContext): Promise<void> {
+    // Find the associated prompt
+    const row = (Array.from(this.ctx.storage.sql.exec("SELECT id, status FROM prompts WHERE fiber_id = ?", ctx.id))[0] as SqlRow | null);
+    if (!row) return;
+
+    const promptId = String(row.id);
+    const fiber = this.getFiber(ctx.id);
+
+    if (fiber?.status === "cancelled") {
+      // lifecycle.finish dispatches the prompt-aborted notification per policy
+      await this.finishPrompt(promptId, { error: "Prompt aborted", status: "aborted" });
+    } else if (fiber?.status === "failed") {
+      const error = fiber.error ?? "Prompt failed after max retries";
+      // lifecycle.finish dispatches the prompt-error notification per policy
+      await this.finishPrompt(promptId, { error, status: "failed" });
+    }
+
+    await this.syncSessionIndex({ status: "idle" });
+    this.emitEvent({ data: this.listPrompts(), type: "prompt" });
+    this.emitEvent({ data: this.readSessionDetails(), type: "state" });
+  }
+
+  // ─── Think chat integration ───
+
+  /**
+   * Configure the Think session from request headers.
+   * On first call, sets up the full config. On subsequent calls, updates
+   * the model/gateway if they've changed (e.g. user changed model in settings).
+   */
+  private ensureThinkConfig(request: Request): void {
+    const incomingModel = request.headers.get("x-dodo-model") ?? this.env.DEFAULT_MODEL;
+    const incomingGateway = request.headers.get("x-dodo-gateway") === "ai-gateway" ? "ai-gateway" as const : "opencode" as const;
+    const existing = this.getConfig();
+
+    if (existing) {
+      // Check if model or gateway changed — if so, reconfigure
+      if (existing.model === incomingModel && existing.activeGateway === incomingGateway) {
+        return; // No change
+      }
+      this.configure({
+        ...existing,
+        model: incomingModel,
+        activeGateway: incomingGateway,
+        opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? existing.opencodeBaseURL,
+        aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? existing.aiGatewayBaseURL,
+      });
+      return;
+    }
+
+    // First-time setup
+    const config: DodoConfig = {
+      sessionId: this.sessionId(),
+      ownerEmail: this.readMetadata("owner_email") ?? "",
+      createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
+      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      activeGateway: incomingGateway,
+      gitAuthorEmail: this.env.GIT_AUTHOR_EMAIL ?? "dodo@example.com",
+      gitAuthorName: this.env.GIT_AUTHOR_NAME ?? "Dodo",
+      model: incomingModel,
+      opencodeBaseURL: request.headers.get("x-dodo-opencode-base-url") ?? this.env.OPENCODE_BASE_URL,
+      aiGatewayBaseURL: request.headers.get("x-dodo-ai-base-url") ?? this.env.AI_GATEWAY_BASE_URL,
+    };
+    this.configure(config);
+  }
+
+  /** Insert a metadata record for a Think message. */
+  private insertMessageMetadata(input: {
+    messageId: string;
+    authorEmail?: string | null;
+    model?: string | null;
+    provider?: string | null;
+    tokenInput?: number;
+    tokenOutput?: number;
+  }): void {
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO message_metadata (message_id, author_email, model, provider, token_input, token_output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      input.messageId,
+      input.authorEmail ?? null,
+      input.model ?? null,
+      input.provider ?? null,
+      input.tokenInput ?? 0,
+      input.tokenOutput ?? 0,
+      nowEpoch(),
+    );
+  }
+
+  /**
+   * Persist an attachment reference. Used for tool-produced screenshots and
+   * assistant-generated images so history restore after reload can surface
+   * the same images that were visible during the stream.
+   *
+   * For tool attachments, `messageId` is initially the tool call id (we
+   * don't know the assistant messageId at tool-result time). After the
+   * stream completes, `rebindToolAttachments` remaps the rows.
+   */
+  private insertMessageAttachment(input: {
+    messageId: string;
+    toolCallId?: string | null;
+    mediaType: string;
+    url: string;
+    size: number;
+    source: "user" | "assistant" | "tool";
+  }): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO message_attachments (message_id, tool_call_id, media_type, url, size, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      input.messageId,
+      input.toolCallId ?? null,
+      input.mediaType,
+      input.url,
+      input.size,
+      input.source,
+      nowEpoch(),
+    );
+  }
+
+  /**
+   * Rebind attachments originally stored under a tool_call_id to the actual
+   * assistant message id, now that the stream has finished and we know it.
+   * Idempotent — repeated calls with the same args do nothing new.
+   */
+  private rebindToolAttachments(toolCallIds: string[], assistantMessageId: string): void {
+    if (toolCallIds.length === 0) return;
+    const placeholders = toolCallIds.map(() => "?").join(",");
+    this.ctx.storage.sql.exec(
+      `UPDATE message_attachments SET message_id = ? WHERE tool_call_id IN (${placeholders}) AND message_id != ?`,
+      assistantMessageId,
+      ...toolCallIds,
+      assistantMessageId,
+    );
+  }
+
+  /** List attachment refs for one or more messages, ordered by creation time. */
+  private listMessageAttachments(messageIds: string[]): Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool" }>> {
+    const result = new Map<string, Array<{ mediaType: string; url: string; size: number; source: "user" | "assistant" | "tool" }>>();
+    if (messageIds.length === 0) return result;
+    const placeholders = messageIds.map(() => "?").join(",");
+    // Surface `source` so the UI can distinguish user uploads from
+    // tool-produced screenshots and assistant-emitted artifacts. Falls
+    // back to "tool" for legacy rows written before the column became
+    // NOT NULL (defensive — should not happen in practice). (audit
+    // follow-up: previously dead column.)
+    const rows = Array.from(this.ctx.storage.sql.exec(
+      `SELECT message_id, media_type, url, size, source FROM message_attachments WHERE message_id IN (${placeholders}) ORDER BY id ASC`,
+      ...messageIds,
+    ));
+    for (const row of rows) {
+      const id = String(row.message_id);
+      const list = result.get(id) ?? [];
+      const rawSource = row.source === null || row.source === undefined ? "tool" : String(row.source);
+      const source: "user" | "assistant" | "tool" =
+        rawSource === "user" || rawSource === "assistant" || rawSource === "tool" ? rawSource : "tool";
+      list.push({
+        mediaType: String(row.media_type),
+        url: String(row.url),
+        size: Number(row.size ?? 0),
+        source,
+      });
+      result.set(id, list);
+    }
+    return result;
+  }
+
+  /** Read metadata for a Think message. */
+  private readMessageMetadata(messageId: string): MessageMetadata | null {
+    const row = (Array.from(this.ctx.storage.sql.exec(
+      "SELECT message_id, author_email, model, provider, token_input, token_output, created_at FROM message_metadata WHERE message_id = ?",
+      messageId,
+    ))[0] as SqlRow | null);
+    if (!row) return null;
+    return {
+      messageId: String(row.message_id),
+      authorEmail: row.author_email === null ? null : String(row.author_email),
+      model: row.model === null ? null : String(row.model),
+      provider: row.provider === null ? null : String(row.provider),
+      tokenInput: Number(row.token_input ?? 0),
+      tokenOutput: Number(row.token_output ?? 0),
+      createdAt: Number(row.created_at),
+    };
+  }
+
+  /**
+   * List messages from Think storage, joined with sidecar metadata and
+   * persisted attachment refs. Returns ChatMessageRecord[] for backward
+   * compatibility.
+   *
+   * Attachments come from two places:
+   *   1. The UIMessage parts themselves — user uploads and assistant-
+   *      generated file parts live here. uiMessageToChatRecord handles them.
+   *   2. The message_attachments table — tool-produced screenshots and
+   *      assistant-generated images, stored separately because Think's
+   *      enforceRowSizeLimit would strip them from message parts at >1KB.
+   *
+   * We merge both so the client sees a single `attachments` list regardless
+   * of which storage path produced it.
+   */
+  private listThinkMessages(): ChatMessageRecord[] {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return [];
+    const history = this.sessions.getHistory(thinkSessionId);
+    const records = history.map((msg) => {
+      const meta = this.readMessageMetadata(msg.id);
+      return uiMessageToChatRecord(msg, meta ?? undefined);
+    });
+    if (records.length === 0) return records;
+    const attachmentsByMsgId = this.listMessageAttachments(records.map((r) => r.id));
+    for (const record of records) {
+      const persisted = attachmentsByMsgId.get(record.id);
+      if (!persisted || persisted.length === 0) continue;
+      // Rewrite stored URLs (dodo-attachment://) to session-scoped HTTP paths
+      // the client can load. rewriteAttachmentsForClient leaves data URLs and
+      // external URLs untouched for the local-dev fallback path.
+      const rewritten = rewriteAttachmentsForClient(persisted) ?? persisted;
+      const merged = [...(record.attachments ?? []), ...rewritten];
+      // Dedupe by URL — if the same image ended up on both the UIMessage
+      // part and the side-table (shouldn't happen in practice, but belt-
+      // and-braces), we don't want the client to render it twice.
+      const seen = new Set<string>();
+      record.attachments = merged.filter((a) => {
+        if (seen.has(a.url)) return false;
+        seen.add(a.url);
+        return true;
+      });
+    }
+    return records;
+  }
+
+  /**
+   * Run a chat turn via Think.chat().
+   * Bridges Think streaming events to Dodo's SSE/WS event format.
+   * Returns the assistant message ID and token usage.
+   */
+  private async runThinkChat(
+    userContent: string,
+    options?: { authorEmail?: string; signal?: AbortSignal; images?: Array<{ data: string; mediaType: string }> },
+  ): Promise<{ assistantMessageId: string; tokenInput: number; tokenOutput: number; text: string }> {
+    // Connect MCP servers before Think calls getTools()
+    await this.connectMcpServers();
+
+    // Insert user message metadata
+    const userMsgId = crypto.randomUUID();
+    const parts: UIMessage["parts"] = [{ type: "text", text: userContent }];
+    if (options?.images?.length) {
+      for (const img of options.images) {
+        // Sanitize SVG uploads here — user-uploaded SVGs stay inline as
+        // `data:` URLs (we don't write them to R2), so this is the only
+        // place the sanitizer runs for them. `<img>`-loaded SVG is inert
+        // in browsers, but click-to-zoom navigates to the data URL which
+        // could execute scripts in older browsers or non-Chromium engines.
+        // Returns null for malformed/oversized SVGs — silently drop the
+        // bad part rather than fail the whole message.
+        const sanitized = sanitizeUserImage(img.data, img.mediaType);
+        if (sanitized === null) {
+          log("warn", "sanitizeUserImage rejected attachment", {
+            sessionId: this.sessionId(),
+            mediaType: img.mediaType,
+            bytes: img.data.length,
+          });
+          continue;
+        }
+        // Pass raw base64 in the url field — the AI SDK's downloadAssets step
+        // tries new URL(data) which throws for raw base64 (not a valid URL),
+        // so it skips the download. convertToLanguageModelV3DataContent then
+        // handles the raw string as inline base64 data.
+        const filePart = {
+          type: "file",
+          mediaType: img.mediaType,
+          url: sanitized,
+        } satisfies FileUIPart;
+        parts.push(filePart);
+      }
+    }
+    const userMsg: UIMessage = {
+      id: userMsgId,
+      role: "user",
+      parts,
+    };
+
+    this.insertMessageMetadata({
+      messageId: userMsgId,
+      authorEmail: options?.authorEmail,
+    });
+
+    // Emit user message event in Dodo format
+    const userRecord = uiMessageToChatRecord(userMsg, {
+      messageId: userMsgId,
+      authorEmail: options?.authorEmail ?? null,
+      model: null,
+      provider: null,
+      tokenInput: 0,
+      tokenOutput: 0,
+      createdAt: nowEpoch(),
+    });
+    this.emitEvent({ data: userRecord, type: "message" });
+
+    // Track assistant response metadata
+    let assistantMessageId = "";
+    let fullText = "";
+    let streamError: string | null = null;
+
+    // Reset per-turn tool attachment cache. The map is keyed by toolCallId and
+    // populated by the onToolAttachments callback in getTools() — clearing here
+    // ensures attachments from a previous prompt don't leak into this turn's
+    // tool_result events.
+    this._toolAttachments.clear();
+    // Reset per-turn tool-call name set so the chat-monitor brain nudge
+    // checks against tools actually called THIS turn.
+    this._toolCallNames.clear();
+    // Collect assistant-generated images streamed during this turn. Uploaded
+    // to R2 at onDone() once we know the assistant message id.
+    const generatedImages: Array<{ mediaType: string; url: string }> = [];
+
+    const callback: StreamCallback = {
+      onEvent: (json: string) => {
+        try {
+          const chunk = JSON.parse(json);
+          // Bridge Think chunk events to Dodo SSE format. Chunks come from
+          // the AI SDK's `toUIMessageStream()` pipeline — see the ai package
+          // for the full chunk type union.
+          if (chunk.type === "text-delta") {
+            const delta = chunk.delta ?? "";
+            fullText += delta;
+            this.emitEvent({ data: { delta }, type: "text_delta" });
+          } else if (chunk.type === "tool-input-available") {
+            // Tool arguments finalised — show the user that a tool is running.
+            this._toolCallNames.add(String(chunk.toolName));
+            this.emitEvent({
+              data: {
+                toolCallId: chunk.toolCallId,
+                toolName: chunk.toolName,
+                input: chunk.input,
+              },
+              type: "tool_call",
+            });
+          } else if (chunk.type === "tool-output-available") {
+            // Tool finished — emit the result plus any images the tool
+            // produced (streamed earlier via the onToolAttachments callback).
+            const refs = this._toolAttachments.get(chunk.toolCallId) ?? [];
+            this.emitEvent({
+              data: {
+                toolCallId: chunk.toolCallId,
+                output: chunk.output,
+                attachments: rewriteAttachmentsForClient(
+                  refs.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size })),
+                ),
+              },
+              type: "tool_result",
+            });
+          } else if (chunk.type === "file") {
+            // Assistant generated an image (Gemini, Gemma vision, etc.).
+            // The AI SDK emits a data URL; we defer the R2 upload to onDone()
+            // so we can key it by the assistant message id.
+            if (typeof chunk.mediaType === "string" && typeof chunk.url === "string") {
+              generatedImages.push({ mediaType: chunk.mediaType, url: chunk.url });
+            }
+          } else if (chunk.type === "error") {
+            // AI SDK emits { type: "error", errorText: "..." } when the gateway
+            // returns an error. Think's applyChunkToParts silently drops these.
+            // Capture so we can throw after the stream ends.
+            streamError = chunk.errorText ?? chunk.error ?? "Unknown LLM error";
+            console.error("[runThinkChat] stream error chunk:", streamError);
+          }
+          // Token usage is captured via onChatMessage() override — see _lastUsage.
+        } catch {
+          // Skip unparseable chunks
+        }
+      },
+      onDone: () => {
+        // After chat completes, find the latest assistant message
+        const history = this.getHistory();
+        const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
+        if (lastAssistant) {
+          assistantMessageId = lastAssistant.id;
+          // Extract text from parts
+          fullText = lastAssistant.parts
+            .filter((p): p is { type: "text"; text: string } => p.type === "text")
+            .map((p) => p.text)
+            .join("");
+        }
+      },
+      onError: (error: string) => {
+        console.error("Think chat error:", error);
+        streamError = error;
+      },
+    };
+
+    await this.chat(userMsg, callback, { signal: options?.signal });
+
+    // Flush workspace changes to Artifacts. Never blocks the turn —
+    // we attach a then-handler to update the read-side cache flag,
+    // and a catch to swallow any rejection so an unhandled-rejection
+    // warning never reaches Workers logs.
+    const artifactsCtx = await this.getOrCreateArtifactsContext().catch(() => null);
+    if (artifactsCtx) {
+      flushTurnToArtifacts({
+        workspace: this.workspace,
+        remote: artifactsCtx.remote,
+        tokenSecret: artifactsCtx.tokenSecret,
+        message: `dodo: turn ${new Date().toISOString()}`,
+        author: options?.authorEmail
+          ? { name: options.authorEmail, email: options.authorEmail }
+          : { name: "Dodo", email: "dodo@workers.dev" },
+      })
+        .then((pushed) => {
+          // On a successful push, lift the first-flush gate and mark
+          // any existing read-side cache stale.
+          if (pushed) this.markArtifactsFsDirty();
+        })
+        .catch(() => {
+          // flushTurnToArtifacts catches its own errors and returns
+          // false, but belt-and-braces in case it ever throws.
+        });
+    }
+
+    // If the stream contained an error chunk that Think silently dropped,
+    // throw it so the caller (runFiberPrompt) can surface it properly.
+    if (streamError && !fullText) {
+      throw new Error(streamError);
+    }
+
+    // Get config for provider info
+    const config = this.getConfig();
+    const model = config?.model ?? this.env.DEFAULT_MODEL;
+    const gateway = config?.activeGateway ?? "opencode";
+
+    // Read captured token usage from onChatMessage() override
+    const tokenInput = this._lastUsage?.inputTokens ?? 0;
+    const tokenOutput = this._lastUsage?.outputTokens ?? 0;
+
+    // Insert assistant message metadata
+    if (assistantMessageId) {
+      this.insertMessageMetadata({
+        messageId: assistantMessageId,
+        model,
+        provider: gateway,
+        tokenInput,
+        tokenOutput,
+      });
+
+      // Rebind any tool-produced attachments recorded during this turn from
+      // their tool_call_id buckets to the actual assistant message id. This
+      // is what makes screenshots show up on reload — listMessageAttachments
+      // queries by message_id, and without the rebind the rows would only be
+      // findable via tool_call_id which isn't on the ChatMessageRecord.
+      const toolCallIds = Array.from(this._toolAttachments.keys());
+      if (toolCallIds.length > 0) {
+        this.rebindToolAttachments(toolCallIds, assistantMessageId);
+      }
+    }
+
+    // Persist any assistant-generated images to R2 and emit a message-level
+    // attachments event so the UI can render them. We do this post-stream
+    // because we need the assistant message id (only known after onDone) to
+    // key the R2 object. The inline data URL remains on the UIMessage part;
+    // `uiMessageToChatRecord` handles the transport from data URL → served URL.
+    if (assistantMessageId && generatedImages.length > 0) {
+      const uploaded: AttachmentRef[] = [];
+      for (const img of generatedImages) {
+        const ref = await uploadAttachment(this.env, {
+          sessionId: this.sessionId(),
+          messageId: assistantMessageId,
+          mediaType: img.mediaType,
+          data: img.url, // uploadAttachment strips the data: prefix
+          ownerEmail: options?.authorEmail,
+          source: "assistant",
+        });
+        if (ref) uploaded.push(ref);
+      }
+      if (uploaded.length > 0) {
+        // Persist before emitting — if the client reloads during emission
+        // we still want the image to surface from history.
+        for (const ref of uploaded) {
+          this.insertMessageAttachment({
+            messageId: assistantMessageId,
+            mediaType: ref.mediaType,
+            url: ref.url,
+            size: ref.size,
+            source: "assistant",
+          });
+        }
+        this.emitEvent({
+          data: {
+            messageId: assistantMessageId,
+            attachments: rewriteAttachmentsForClient(
+              uploaded.map((r) => ({ mediaType: r.mediaType, url: r.url, size: r.size })),
+            ),
+          },
+          type: "message_attachments",
+        });
+      }
+    }
+
+    // Check if context compaction is needed.
+    // Awaited (not fire-and-forget) so the compaction completes before the next
+    // request arrives. Without this, there's a race: the next chat() call may
+    // start before addCompaction() finishes, causing getHistory() to return
+    // the old non-compacted messages and the compaction summary to be invisible.
+    try {
+      await this.maybeCompactContext();
+    } catch (err) {
+      console.warn("[compaction] Post-chat compaction failed:", err instanceof Error ? err.message : err);
+    }
+
+    return { assistantMessageId, tokenInput, tokenOutput, text: fullText };
+  }
+
+  /**
+   * Check if context compaction is needed and run it if so.
+   *
+   * Implements several context management tactics from pi-mono:
+   * - Turn-aware cut points: never splits tool-call/result pairs
+   * - Conversation serialization: [Role]: format with 2K tool result cap
+   * - Structured summary format: rigid template with cumulative file tracking
+   * - Iterative summary updates: updates previous summary instead of regenerating
+   *
+   * Triggers when the last turn's input tokens exceed COMPACTION_TRIGGER_PERCENT
+   * of the context budget.
+   */
+  /**
+   * Number of compaction summaries persisted for the current Think session.
+   * Used by the own-loop to decide whether a `maybeCompactContext()` call
+   * actually summarised something or no-op'd (see `outcome: "summarised"`
+   * vs `"noop"` log lines). Returns 0 when there is no active session.
+   */
+  private getCompactionCount(): number {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return 0;
+    return this.sessions.getCompactions(thinkSessionId).length;
+  }
+
+  private async maybeCompactContext(options?: { force?: boolean }): Promise<void> {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return;
+
+    // Check if context usage warrants compaction
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+
+    // When force=true (overflow recovery) or context was truncated by
+    // assembleContext(), skip the usage threshold check. The truncation flag
+    // catches the Catch-22: assembleContext drops old messages → LLM reports
+    // low usage → compaction threshold not met → messages stay dropped forever.
+    const contextWasTruncated = this._contextTruncated;
+    this._contextTruncated = false; // Reset for next turn
+
+    const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
+      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    ))[0] as SqlRow | null);
+    const lastInputTokens = Number(latestAssistant?.token_input ?? 0);
+    if (!options?.force && !contextWasTruncated && lastInputTokens === 0) return;
+
+    const history = this.sessions.getHistory(thinkSessionId);
+    const realMessages = history.filter((m) => !m.id.startsWith("compaction_"));
+
+    if (
+      !shouldCompact({
+        messageCount: history.length,
+        realMessageCount: realMessages.length,
+        estimatedTokens: lastInputTokens,
+        modelContextWindow: contextWindow,
+        thresholdRatio: COMPACTION_TRIGGER_PERCENT / 100,
+        force: options?.force,
+        contextWasTruncated,
+      })
+    ) {
+      return;
+    }
+
+    // ─── Turn-aware cut point (Tactic 4) ───
+    // Find the cut point that doesn't split tool-call/result pairs.
+    // A "turn" is: user message → assistant message(s) → tool result(s).
+    // Valid cut points: the boundary BEFORE a user message.
+    const targetCompactCount = Math.max(2, Math.floor(realMessages.length * COMPACTION_MESSAGE_FRACTION));
+    let compactCount = targetCompactCount;
+
+    // Walk forward from the target cut point to find a valid boundary.
+    // A valid boundary is right before a "user" message (never between
+    // an assistant tool-call and its result, or mid-assistant-turn).
+    while (compactCount < realMessages.length - 2) {
+      const nextMsg = realMessages[compactCount];
+      if (nextMsg.role === "user") break; // Valid cut: next message starts a new turn
+      compactCount++; // Skip forward past tool results / mid-turn messages
+    }
+    // If we couldn't find a valid cut point, fall back to the target
+    if (compactCount >= realMessages.length - 2) {
+      compactCount = targetCompactCount;
+    }
+
+    const messagesToCompact = realMessages.slice(0, compactCount);
+    // Guard against the pathological case where realMessages has fewer
+    // entries than targetCompactCount (e.g. force=true on the very first
+    // turn, when Think hasn't persisted the assistant message yet and
+    // realMessages.length === 1). Without this we'd hit
+    // `messagesToCompact[1].id` → TypeError on undefined.
+    if (messagesToCompact.length < 2) {
+      log("info", "compaction: skipped — fewer than 2 real messages to compact", {
+        sessionId: this.sessionId(),
+        realMessageCount: realMessages.length,
+      });
+      return;
+    }
+    const fromMessageId = messagesToCompact[0].id;
+    const toMessageId = messagesToCompact[messagesToCompact.length - 1].id;
+
+    // Check if this range is already compacted
+    const existingCompactions = this.sessions.getCompactions(thinkSessionId);
+    const alreadyCompacted = existingCompactions.some(
+      (c) => c.from_message_id === fromMessageId || c.to_message_id === toMessageId,
+    );
+    if (alreadyCompacted) return;
+
+    // ─── Cumulative file tracking (Tactic 3) ───
+    // Track files read and modified across the messages being compacted.
+    // Also carry forward file lists from previous compactions.
+    const readFiles = new Set<string>();
+    const modifiedFiles = new Set<string>();
+
+    // Carry forward from previous compaction summaries
+    for (const compaction of existingCompactions) {
+      const fileMatch = compaction.summary.match(/<read-files>([\s\S]*?)<\/read-files>/);
+      if (fileMatch) {
+        fileMatch[1].split("\n").map(f => f.trim()).filter(Boolean).forEach(f => readFiles.add(f));
+      }
+      const modMatch = compaction.summary.match(/<modified-files>([\s\S]*?)<\/modified-files>/);
+      if (modMatch) {
+        modMatch[1].split("\n").map(f => f.trim()).filter(Boolean).forEach(f => modifiedFiles.add(f));
+      }
+    }
+
+    // Extract file operations from messages being compacted.
+    // UIMessage tool parts in AI SDK v5 use type "dynamic-tool" (not "tool-invocation"),
+    // field "input" (not "args"), and "output" (not "result").
+    for (const msg of messagesToCompact) {
+      if (msg.role !== "assistant") continue;
+      for (const part of msg.parts) {
+        const p = part as { type: string; toolName?: string; input?: Record<string, unknown> };
+        if (p.type !== "dynamic-tool" || !p.toolName) continue;
+        const path = (p.input?.path as string) ?? "";
+        if (!path) continue;
+        if (p.toolName === "read") readFiles.add(path);
+        else if (p.toolName === "write") modifiedFiles.add(path);
+        else if (p.toolName === "edit") modifiedFiles.add(path);
+      }
+    }
+
+    // Remove modified files from the read set (modified takes precedence)
+    for (const f of modifiedFiles) readFiles.delete(f);
+
+    // ─── Conversation serialization (Tactic 6) ───
+    // Convert messages to flat [Role]: text format with 2K cap on tool results.
+    // This prevents the summarizer from entering "conversation mode".
+    const TOOL_RESULT_CAP = 2_000;
+    const serializedParts: string[] = [];
+    for (const msg of messagesToCompact) {
+      const textContent = msg.parts
+        ?.filter((p: { type: string }) => p.type === "text")
+        .map((p: { type: string; text?: string }) => (p as { text: string }).text)
+        .join("") ?? "";
+
+      if (msg.role === "user" && textContent) {
+        serializedParts.push(`[User]: ${textContent.slice(0, 2_000)}`);
+      } else if (msg.role === "assistant") {
+        // Extract tool calls (AI SDK v5: "dynamic-tool" parts with "input" field)
+        const toolCalls = msg.parts
+          ?.filter((p: { type: string }) => p.type === "dynamic-tool")
+          .map((p: { type: string; toolName?: string; input?: unknown }) => {
+            const tc = p as { toolName: string; input: unknown };
+            return `${tc.toolName}(${JSON.stringify(tc.input ?? {}).slice(0, 500)})`;
+          }) ?? [];
+
+        if (textContent) {
+          serializedParts.push(`[Assistant]: ${textContent.slice(0, 2_000)}`);
+        }
+        if (toolCalls.length > 0) {
+          serializedParts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+        }
+
+        // Extract tool results embedded in assistant parts
+        // AI SDK v5: "dynamic-tool" parts with "output" field (state === "output-available")
+        for (const part of msg.parts ?? []) {
+          const p = part as { type: string; output?: unknown; toolName?: string; state?: string };
+          if (p.type === "dynamic-tool" && p.output !== undefined) {
+            const resultStr = typeof p.output === "string" ? p.output : JSON.stringify(p.output);
+            const capped = resultStr.length > TOOL_RESULT_CAP
+              ? resultStr.slice(0, TOOL_RESULT_CAP) + `\n\n[... ${resultStr.length - TOOL_RESULT_CAP} more chars truncated]`
+              : resultStr;
+            serializedParts.push(`[Tool result (${p.toolName ?? "unknown"})]: ${capped}`);
+          }
+        }
+      }
+    }
+
+    if (serializedParts.length === 0) return;
+
+    const summaryInput = serializedParts.join("\n\n");
+
+    // ─── Iterative summary update (Tactic 2) ───
+    // If there's a previous compaction, use the "update" prompt to preserve
+    // accumulated context. Otherwise use the "create" prompt.
+    const previousSummary = existingCompactions.length > 0
+      ? existingCompactions[existingCompactions.length - 1].summary
+      : null;
+
+    // ─── Structured summary format (Tactic 3) ───
+    const STRUCTURED_SUMMARY_PROMPT = [
+      "Create a structured context checkpoint summary following this EXACT format:",
+      "",
+      "## Goal",
+      "[What the user is trying to accomplish — 1-2 sentences]",
+      "",
+      "## Constraints & Preferences",
+      "- [Requirements mentioned by user]",
+      "",
+      "## Progress",
+      "### Done",
+      "- [x] [Completed tasks with specific file paths]",
+      "### In Progress",
+      "- [ ] [Current work]",
+      "### Blocked",
+      "- [Issues preventing progress, if any]",
+      "",
+      "## Key Decisions",
+      "- **[Decision]**: [Rationale]",
+      "",
+      "## Next Steps",
+      "1. [What should happen next]",
+      "",
+      "## Critical Context",
+      "- [Specific data, error messages, or configurations needed to continue]",
+      "",
+      "PRESERVE exact file paths, function names, error messages, and technical specifics.",
+      "Be factual and concrete. No vague summaries.",
+    ].join("\n");
+
+    const UPDATE_SUMMARY_PROMPT = [
+      "Update the existing structured summary with new information from the conversation.",
+      "",
+      "Rules:",
+      "- PRESERVE all existing information that is still relevant",
+      "- ADD new progress, decisions, and context",
+      "- Move items from 'In Progress' to 'Done' when completed",
+      "- UPDATE 'Next Steps' based on what was accomplished",
+      "- PRESERVE exact file paths, function names, error messages",
+      "- REMOVE items only if they are clearly no longer relevant",
+      "",
+      "Output the COMPLETE updated summary using the same format:",
+      "",
+      "## Goal",
+      "## Constraints & Preferences",
+      "## Progress (Done / In Progress / Blocked)",
+      "## Key Decisions",
+      "## Next Steps",
+      "## Critical Context",
+    ].join("\n");
+
+    try {
+      // Build a Workers AI provider for compaction. The AI Gateway provides an
+      // OpenAI-compatible endpoint at {base}/workers-ai/v1 that accepts @cf/ model IDs.
+      // Build the user message with conversation + optional previous summary
+      const userParts: string[] = [];
+      userParts.push("<conversation>");
+      userParts.push(summaryInput.slice(0, 30_000));
+      userParts.push("</conversation>");
+
+      if (previousSummary) {
+        userParts.push("");
+        userParts.push("<previous-summary>");
+        userParts.push(previousSummary);
+        userParts.push("</previous-summary>");
+      }
+
+      userParts.push("");
+      userParts.push(previousSummary ? UPDATE_SUMMARY_PROMPT : STRUCTURED_SUMMARY_PROMPT);
+
+      const compactionMessages: Array<{ role: "system" | "user"; content: string }> = [
+        {
+          role: "system",
+          content: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Do NOT continue the conversation. ONLY output the structured summary.",
+        },
+        {
+          role: "user",
+          content: userParts.join("\n"),
+        },
+      ];
+
+      // Use the session's LLM gateway to call the compaction model.
+      // Tries COMPACTION_MODEL first, falls back to the session model if it fails.
+      const appConfig = this.getAppConfigFromThink();
+      const provider = buildProvider(appConfig, this.env);
+      let summary: string | undefined;
+      let compactionModelUsed = COMPACTION_MODEL;
+      try {
+        const compactionLLM = provider.chatModel(COMPACTION_MODEL);
+        const result = await generateText({
+          model: compactionLLM,
+          messages: compactionMessages,
+          maxOutputTokens: 2048,
+        });
+        summary = result.text;
+        if (summary) {
+          log("info", "compaction: summary generated", {
+            sessionId: this.sessionId(),
+            model: COMPACTION_MODEL,
+            summaryChars: summary.length,
+          });
+        }
+      } catch (compactionErr) {
+        compactionModelUsed = modelId;
+        log("warn", "compaction: primary model failed, falling back to session model", {
+          sessionId: this.sessionId(),
+          model: COMPACTION_MODEL,
+          fallback: modelId,
+          error: compactionErr instanceof Error ? compactionErr.message : String(compactionErr),
+        });
+        const fallbackModel = provider.chatModel(modelId);
+        const result = await generateText({
+          model: fallbackModel,
+          messages: compactionMessages,
+          maxOutputTokens: 1500,
+        });
+        summary = result.text;
+      }
+      if (!summary || summary.length < 20) return;
+
+      // Append cumulative file tracking tags
+      const readFileList = [...readFiles].sort();
+      const modFileList = [...modifiedFiles].sort();
+      if (readFileList.length > 0) {
+        summary += `\n\n<read-files>\n${readFileList.join("\n")}\n</read-files>`;
+      }
+      if (modFileList.length > 0) {
+        summary += `\n\n<modified-files>\n${modFileList.join("\n")}\n</modified-files>`;
+      }
+
+      // Tag summary with model used (for diagnostics via debug endpoint)
+      summary += `\n\n<!-- compaction-model: ${compactionModelUsed} -->`;
+
+      this.sessions.addCompaction(thinkSessionId, summary, fromMessageId, toMessageId);
+      log("info", "compaction complete", {
+        sessionId: this.sessionId(),
+        compactedMessages: compactCount,
+        summaryChars: summary.length,
+        model: compactionModelUsed,
+        readFiles: readFileList.length,
+        modifiedFiles: modFileList.length,
+        iterative: !!previousSummary,
+      });
+    } catch (error) {
+      console.warn(
+        "[compaction:ERROR] Failed to generate summary:",
+        error instanceof Error ? `${error.message}\n${error.stack}` : error,
+      );
+    }
+  }
+
+  private ensureMetadata(sessionId: string, ownerEmail?: string | null): void {
+    this.control.ensureBootstrap(sessionId, ownerEmail);
+  }
+
+   private readSessionDetails(): SessionState {
+    const snap = this.control.read();
+    const createdAt = snap.createdAt ?? new Date().toISOString();
+    const updatedAt = snap.updatedAt ?? createdAt;
+    const sessionId = snap.sessionId ?? "";
+    const ownerEmail = snap.ownerEmail ?? undefined;
+    const activePromptId = snap.activePromptId;
+    let status: SessionState["status"] = snap.status;
+    // Reconcile stale "running" status when no prompt is active
+    if (status === "running" && !activePromptId) {
+      this.control.setStatus("idle");
+      status = "idle";
+      // Fire-and-forget sync to UserControl
+      void this.syncSessionIndex({ status: "idle" }).catch(() => {});
+    }
+    // Get token totals from the appropriate source
+    const metaTotals = (Array.from(this.ctx.storage.sql.exec("SELECT COALESCE(SUM(token_input), 0) AS total_in, COALESCE(SUM(token_output), 0) AS total_out FROM message_metadata"))[0] as SqlRow | null);
+    const totalTokenInput = Number(metaTotals?.total_in ?? 0);
+    const totalTokenOutput = Number(metaTotals?.total_out ?? 0);
+
+    // Context window info
+    const config = this.getConfig();
+    const modelId = config?.model ?? this.env.DEFAULT_MODEL ?? "";
+    const contextWindow = CONTEXT_WINDOW_TOKENS[modelId] ?? DEFAULT_CONTEXT_WINDOW;
+    const contextBudget = Math.floor(contextWindow * CONTEXT_BUDGET_FACTOR);
+    // Use latest assistant turn's input tokens as the best proxy for current context size
+    const latestAssistant = (Array.from(this.ctx.storage.sql.exec(
+      "SELECT token_input FROM message_metadata WHERE model IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    ))[0] as SqlRow | null);
+    const estimatedContext = Number(latestAssistant?.token_input ?? 0);
+    const contextUsagePercent = contextBudget > 0
+      ? Math.round((estimatedContext / contextBudget) * 100)
+      : 0;
+
+    // Compaction info
+    const thinkSid = this.getCurrentSessionId();
+    const compactionCount = thinkSid ? this.sessions.getCompactions(thinkSid).length : 0;
+
+    return {
+      activePromptId,
+      activeStreamCount: this.clients.size,
+      compactionCount,
+      contextBudget,
+      contextUsagePercent,
+      contextWindow,
+      createdAt,
+      messageCount: this.messageCount(),
+      model: modelId,
+      ownerEmail,
+      sessionId,
+      status,
+      totalTokenInput,
+      totalTokenOutput,
+      updatedAt,
+    };
+  }
+
+  /**
+   * Build a token usage report for the current session.
+   * Returns cumulative totals, context window info, and per-message breakdown.
+   */
+  private listMessages(): ChatMessageRecord[] {
+    return this.listThinkMessages();
+  }
+
+  private messageCount(): number {
+    const thinkSessionId = this.getCurrentSessionId();
+    if (!thinkSessionId) return 0;
+    return this.sessions.getMessageCount(thinkSessionId);
+  }
+
+  private insertPrompt(promptId: string, content: string, status: PromptRecord["status"], authorEmail?: string | null): void {
+    const sessionId = this.sessionId();
+    const createdAt = nowEpoch();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO prompts (id, session_id, content, status, author_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      promptId,
+      sessionId,
+      content,
+      status,
+      authorEmail ?? null,
+      createdAt,
+      createdAt,
+    );
+  }
+
+  private updatePrompt(
+    promptId: string,
+    patch: { error?: string; resultMessageId?: string; status: PromptRecord["status"] },
+  ): void {
+    const existing = (Array.from(this.ctx.storage.sql.exec("SELECT error, result_message_id FROM prompts WHERE id = ?", promptId))[0] as SqlRow | null);
+    this.ctx.storage.sql.exec(
+      "UPDATE prompts SET status = ?, error = ?, result_message_id = ?, updated_at = ? WHERE id = ?",
+      patch.status,
+      patch.error ?? (existing?.error === null || existing?.error === undefined ? null : String(existing.error)),
+      patch.resultMessageId ??
+        (existing?.result_message_id === null || existing?.result_message_id === undefined
+          ? null
+          : String(existing.result_message_id)),
+      nowEpoch(),
+      promptId,
+    );
+  }
+
+  private listPrompts(): PromptRecord[] {
+    return Array.from(this.ctx.storage.sql.exec(
+      "SELECT id, content, status, error, result_message_id, author_email, created_at, updated_at FROM prompts ORDER BY created_at DESC, rowid DESC",
+    )).map((row) => ({
+      authorEmail: row.author_email === null || row.author_email === undefined ? null : String(row.author_email),
+      content: String(row.content),
+      createdAt: epochToIso(row.created_at),
+      error: row.error === null ? null : String(row.error),
+      id: String(row.id),
+      resultMessageId: row.result_message_id === null ? null : String(row.result_message_id),
+      status: row.status as PromptRecord["status"],
+      updatedAt: epochToIso(row.updated_at),
+    }));
+  }
+
+  private mapWorkspaceEntry(entry: {
+    createdAt: number;
+    mimeType: string;
+    name: string;
+    path: string;
+    size: number;
+    type: "file" | "directory" | "symlink";
+    updatedAt: number;
+  }): WorkspaceEntry {
+    return {
+      createdAt: sanitizeTimestamp(entry.createdAt),
+      mimeType: entry.mimeType,
+      name: entry.name,
+      path: entry.path,
+      size: entry.size,
+      type: entry.type,
+      updatedAt: sanitizeTimestamp(entry.updatedAt),
+    };
+  }
+
+  private openEventStream(request: Request): Response {
+    const stream = new TransformStream<Uint8Array>();
+    const writer = stream.writable.getWriter();
+    this.clients.set(writer, Promise.resolve());
+    this.setState({ ...this.readSessionDetails() });
+
+    // Catches required: if the client disconnects before the first writes
+    // resolve, the readable side tears down and writer.write() rejects with
+    // "The readable side of this TransformStream is no longer readable".
+    // Without a handler that surfaces as an unhandled rejection in tests.
+    void this.writeEvent(writer, { data: this.readSessionDetails(), type: "ready" })
+      .catch(() => {
+        this.clients.delete(writer);
+      });
+    // Replay current todos so a freshly-connected client is hydrated without
+    // needing a separate fetch round-trip.
+    void this.writeEvent(writer, { data: { items: this.listTodos() }, type: "todos" })
+      .catch(() => {
+        this.clients.delete(writer);
+      });
+
+    // Periodic heartbeat. Cloudflare and intermediate proxies drop idle
+    // SSE connections after ~100s — without a heartbeat, long-idle
+    // sessions silently disconnect. (audit finding L3)
+    const heartbeatHandle = setInterval(() => {
+      try {
+        void writer.write(new TextEncoder().encode(`:heartbeat\n\n`)).catch(() => {
+          this.clients.delete(writer);
+          clearInterval(heartbeatHandle);
+        });
+      } catch {
+        clearInterval(heartbeatHandle);
+      }
+    }, 30_000);
+
+    request.signal.addEventListener(
+      "abort",
+      () => {
+        clearInterval(heartbeatHandle);
+        this.clients.delete(writer);
+        // close() returns a promise that can reject async — must use .catch()
+        // not try/catch (which only catches sync throws).
+        void writer.close().catch(() => { /* stream may already be closed */ });
+        this.setState({ ...this.readSessionDetails() });
+      },
+      { once: true },
+    );
+
+    return new Response(stream.readable, {
+      headers: {
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        "content-type": "text/event-stream",
+      },
+    });
+  }
+
+  private async writeEvent(writer: WritableStreamDefaultWriter<Uint8Array>, event: SessionEvent): Promise<void> {
+    const payload = `event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
+    // Bound the per-write wait so a stuck client can't pin a chained
+    // promise forever, holding DO CPU time and blocking GC of the event.
+    // 5s is generous for a healthy client and short enough that an
+    // intermediate proxy (Cloudflare front-line, customer corp HTTP
+    // proxy) hanging the connection gets unstuck. (audit finding M16)
+    await Promise.race([
+      writer.write(new TextEncoder().encode(payload)),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error("SSE write timeout")), 5000)),
+    ]);
+  }
+
+  private emitEvent(event: SessionEvent): void {
+    // Broadcast to SSE clients — chain writes per-writer to prevent
+    // concurrent writer.write() calls which violate the WritableStream
+    // contract and silently disconnect clients.
+    for (const [writer, pending] of [...this.clients]) {
+      const next = pending
+        .then(() => this.writeEvent(writer, event))
+        .catch(() => {
+          this.clients.delete(writer);
+        });
+      this.clients.set(writer, next);
+    }
+
+    // Broadcast to WebSocket clients
+    const wsPayload = JSON.stringify({ type: event.type, ...event.data as object });
+    this.broadcastToWebSockets(wsPayload);
+  }
+
+  private requireSessionId(request: Request): string {
+    const sessionId = request.headers.get("x-dodo-session-id");
+    if (!sessionId) {
+      throw new Error("Missing session id header");
+    }
+    return sessionId;
+  }
+
+  private _artifactsRepo: ArtifactsRepo | null = null;
+  private _artifactsRemote: string | null = null;
+  private _artifactsTokenSecret: string | null = null;
+  /**
+   * In-DO clone of the per-session artifacts repo. Lazily populated on
+   * the first /files or /file read once a flush has landed. Refreshed
+   * via fetch+checkout when `_artifactsFsCache.dirty` is true.
+   */
+  private _artifactsFsCache: ArtifactsFsCache | null = null;
+  /**
+   * Set true the first time a flush succeeds. Until then,
+   * getArtifactsFsCache short-circuits to null without consulting the
+   * artifacts binding or attempting a clone — the remote repo has no
+   * commits yet, so any clone would fail and fall through to the
+   * workspace anyway.
+   */
+  private _artifactsHasFlushed: boolean = false;
+
+  private sessionId(): string {
+    return this.readMetadata("session_id") ?? "";
+  }
+
+  /**
+   * Get or create this session's Artifacts repo. Returns null if Artifacts
+   * is unavailable (network error, quota, etc.) — callers must tolerate
+   * absence silently.
+   */
+  async getOrCreateArtifactsContext(sessionIdHint?: string): Promise<{ repo: ArtifactsRepo; remote: string; tokenSecret: string } | null> {
+    if (this._artifactsRepo && this._artifactsRemote && this._artifactsTokenSecret) {
+      return { repo: this._artifactsRepo, remote: this._artifactsRemote, tokenSecret: this._artifactsTokenSecret };
+    }
+
+    try {
+      // Fall back to the hint if DO metadata isn't populated yet (e.g. when
+      // the DO is invoked via RPC from MCP before the first HTTP request
+      // sets session_id metadata).
+      const resolvedSessionId = this.sessionId() || sessionIdHint || "";
+      if (!resolvedSessionId) return null;
+      const name = `dodo-${resolvedSessionId}`;
+      let repo = await this.env.ARTIFACTS.get(name);
+      let remote: string | null = null;
+      let tokenSecret: string | null = null;
+
+      if (!repo) {
+        const created = await this.env.ARTIFACTS.create(name, { setDefaultBranch: "main" });
+        repo = created.repo;
+        remote = created.remote;
+        tokenSecret = stripTokenExpiry(created.token);
+      } else {
+        const info = await repo.info();
+        if (!info?.remote) return null;
+        remote = info.remote;
+        const tokenResult = await repo.createToken("write", ARTIFACTS_TOKEN_TTL_SECONDS);
+        tokenSecret = stripTokenExpiry(tokenResult.token);
+      }
+
+      if (!remote || !tokenSecret) return null;
+
+      this._artifactsRepo = repo;
+      this._artifactsRemote = remote;
+      this._artifactsTokenSecret = tokenSecret;
+      return { repo, remote, tokenSecret };
+    } catch (err) {
+      console.warn("[artifacts] failed to get/create repo:", err);
+      return null;
+    }
+  }
+
+  /**
+   * Lazily get (or refresh) the in-DO clone of the artifacts repo.
+   *
+   * Gated on `_artifactsHasFlushed`: until at least one flush has
+   * succeeded for this session, we know the remote has no commits
+   * and any clone attempt will fail. Returning null early avoids the
+   * wasted HTTP round-trip and the failure log noise.
+   *
+   * Returns null when artifacts isn't reachable, the gate is closed,
+   * or the clone failed — callers must fall back to the workspace
+   * shell.
+   */
+  async getArtifactsFsCache(): Promise<ArtifactsFsCache | null> {
+    if (!this._artifactsHasFlushed) return null;
+    const ctx = await this.getOrCreateArtifactsContext().catch(() => null);
+    if (!ctx) return null;
+    const refreshed = await refreshArtifactsFs({
+      cache: this._artifactsFsCache,
+      remote: ctx.remote,
+      tokenSecret: ctx.tokenSecret,
+    });
+    if (refreshed) {
+      this._artifactsFsCache = refreshed;
+    }
+    return this._artifactsFsCache;
+  }
+
+  /**
+   * Called by the flush hook after a successful push. Two effects:
+   *   1. Lifts the first-flush gate so subsequent reads can populate
+   *      the cache.
+   *   2. Marks any existing cache dirty so the next read fetches the
+   *      new tip.
+   * Cheap — flips two bools.
+   */
+  markArtifactsFsDirty(): void {
+    this._artifactsHasFlushed = true;
+    if (this._artifactsFsCache) {
+      this._artifactsFsCache.dirty = true;
+    }
+    // If cache is null, the next read will clone fresh anyway.
+  }
+
+  // Legacy thin wrappers that delegate to the typed metadataKv adapter.
+  // Most callers should migrate to the typed stores (`this.control`,
+  // `this.goalStore`, `this.watchdogStore`) per ADR-0001; these helpers
+  // remain for keys that haven't been folded into a store yet
+  // (browser_enabled, is_autopilot, autopilot_role, etc.).
+  private readMetadata(key: string): string | null {
+    return this.metadataKv.read(key);
+  }
+
+  private writeMetadata(key: string, value: string): void {
+    this.metadataKv.write(key, value);
+  }
+
+  // ─── Session goals ───
+  //
+  // A goal makes a session self-continuing. When `goal_status === "active"`,
+  // `finalizePromptFromFiber` auto-enqueues a continue prompt at the end of
+  // each turn until the model calls `set_goal_status` with a terminal state
+  // or the turn budget runs out. Stored as plain keys in the `metadata`
+  // table so no schema migration is needed.
+
+  /** Read the full goal state. Safe to call anywhere. */
+  readGoalState(): GoalState {
+    return this.goalStore.read();
+  }
+
+  /** Set or replace the active goal. Resets turn counter. */
+  setGoal(opts: { text: string; maxTurns?: number; role?: string }): GoalState {
+    const state = this.goalStore.set(opts);
+    this.emitEvent({ data: state, type: "goal_state" });
+    return state;
+  }
+
+  /** Update the goal status (called from the `set_goal_status` tool). */
+  updateGoalStatus(status: GoalStatus, summary?: string): GoalState {
+    const state = this.goalStore.updateStatus(status, summary);
+    this.emitEvent({ data: state, type: "goal_state" });
+    return state;
+  }
+
+  /** Clear all goal state. */
+  clearGoal(): void {
+    this.goalStore.clear();
+    this.emitEvent({ data: { status: "none" }, type: "goal_state" });
+  }
+
+  /**
+   * Clear all MCP connections — SDK-managed OAuth servers and static gatekeepers.
+   */
+  async clearAllMcpConnections(): Promise<void> {
+    try {
+      const servers = this.getMcpServers().servers;
+      for (const id of Object.keys(servers)) {
+        try {
+          await this.mcp.removeServer(id);
+        } catch (err) {
+          log("warn", "Failed to remove OAuth MCP", { id, err: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    } catch (err) {
+      log("warn", "Failed to enumerate MCP servers", { err: err instanceof Error ? err.message : String(err) });
+    }
+    for (const gk of this.mcpGatekeepers) {
+      try {
+        gk.disconnect();
+      } catch (err) {
+        log("warn", "Failed to disconnect gatekeeper", { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    this.mcpGatekeepers = [];
+    this.mcpStatus.clear();
+    // Invalidate the TTL cache so the next connectMcpServers() rebuilds.
+    this.mcpConnectedAt = 0;
+    this.mcpEnabledConfigsFingerprint = null;
+  }
+
+  /**
+   * Compare incoming Access email against stored owner_email metadata.
+   * On drift, clear MCPs, update the stored email, and reconnect.
+   */
+  async reconcileOwnerIdentity(incomingEmail: string | null | undefined): Promise<void> {
+    if (!incomingEmail) return;
+    const normalisedIncoming = incomingEmail.trim().toLowerCase();
+    if (!normalisedIncoming) return;
+    const stored = this.readMetadata("owner_email");
+    const normalisedStored = stored ? stored.trim().toLowerCase() : null;
+    if (normalisedStored && normalisedStored === normalisedIncoming) return;
+    log("info", "owner identity drift", { storedEmail: stored ?? null, incomingEmail: normalisedIncoming });
+    await this.clearAllMcpConnections();
+    this.writeMetadata("owner_email", normalisedIncoming);
+    // clearAllMcpConnections() already zeroes mcpConnectedAt /
+    // mcpEnabledConfigsFingerprint; forceReconnect bypasses the cache
+    // anyway. Owner changed = the previous connect state is irrelevant.
+    await this.connectMcpServers({ forceReconnect: true });
+  }
+
+  async refreshMcpState(mcpId: string): Promise<void> {
+    const servers = this.getMcpServers();
+    const server = servers.servers[mcpId];
+    if (!server) throw new Error(`MCP server not found: ${mcpId}`);
+    const url = server.server_url;
+    const name = server.name ?? new URL(url).host;
+    await this.removeMcpServer(mcpId);
+    // Mirror the /api/mcp/start-auth callback path shape.
+    // Use the UserControl DO ID hex (not email) to avoid URL-encoding
+    // mismatches when the OAuth client sends the redirect_uri as a query
+    // parameter — see the long comment in /api/mcp/start-auth.
+    const userId = this.env.USER_CONTROL.idFromName(this.name).toString();
+    await this.addMcpServer(name, url, {
+      callbackHost: this.env.WORKER_URL,
+      callbackPath: `/agents/coding-agent/${userId}/callback`,
+    });
+  }
+
+  /**
+   * RPC: list OAuth-connected MCP tools from this DO's `this.mcp` manager.
+   *
+   * Called from session DOs (keyed by sessionId) that want to federate the
+   * per-user OAuth hub's tools into their own `getTools()` result. The
+   * returned shape is deliberately serialisable for DO-to-DO RPC.
+   */
+  async listOAuthTools(): Promise<Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }>> {
+    try {
+      const tools = this.mcp.listTools() as unknown;
+      const servers = this.getMcpServers().servers as Record<string, { name?: string; server_url?: string } | undefined>;
+      if (!Array.isArray(tools)) return [];
+      const result: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; serverId: string; displayName?: string }> = [];
+      for (const raw of tools) {
+        if (!raw || typeof raw !== "object") continue;
+        const t = raw as { name?: unknown; serverId?: unknown; description?: unknown; inputSchema?: unknown };
+        if (typeof t.name !== "string" || typeof t.serverId !== "string") continue;
+        const server = servers[t.serverId];
+        result.push({
+          name: t.name,
+          description: typeof t.description === "string" ? t.description : undefined,
+          inputSchema: (t.inputSchema && typeof t.inputSchema === "object") ? (t.inputSchema as Record<string, unknown>) : undefined,
+          serverId: t.serverId,
+          displayName: server?.name ?? (server?.server_url ? new URL(server.server_url).host : undefined),
+        });
+      }
+      return result;
+    } catch (err) {
+      log("warn", "listOAuthTools failed", { err: err instanceof Error ? err.message : String(err) });
+      return [];
+    }
+  }
+
+  /**
+   * RPC: invoke an OAuth-connected MCP tool.
+   *
+   * Session DOs call this instead of `this.mcp.callTool` so the OAuth
+   * credentials (which live only in the per-user hub DO) are applied.
+   */
+  async callOAuthTool(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    return this.mcp.callTool({ name: toolName, arguments: args as Record<string, unknown>, serverId });
+  }
+
+  /**
+   * Fetch the current user's OAuth MCP tools from the per-user hub DO.
+   *
+   * Called during `connectMcpServers` for session DOs. No-op if this DO
+   * IS the hub (its name matches `owner_email`), since in that case
+   * `this.mcp.listTools()` is the authoritative source already.
+   */
+  private async loadOAuthToolsFromHub(ownerEmail: string): Promise<void> {
+    const normalisedEmail = ownerEmail.trim().toLowerCase();
+    // If this DO IS the hub (keyed by email, not sessionId), skip — callers
+    // will read `this.mcp.listTools()` directly.
+    const myName = this.name ?? "";
+    if (myName === normalisedEmail) {
+      this.cachedOAuthTools = await this.listOAuthTools();
+      return;
+    }
+
+    try {
+      const hubStub = await getAgentByName<Env, CodingAgent>(
+        this.env.CODING_AGENT as unknown as AgentNamespace<CodingAgent>,
+        normalisedEmail,
+      );
+      const tools = await hubStub.listOAuthTools();
+      this.cachedOAuthTools = tools;
+    } catch (err) {
+      log("warn", "loadOAuthToolsFromHub failed", { err: err instanceof Error ? err.message : String(err) });
+      this.cachedOAuthTools = [];
+    }
+  }
+
+  /**
+   * Call an OAuth MCP tool against the per-user hub DO.
+   *
+   * Used by the session DO's tool-executor to route `this.mcp.callTool`
+   * equivalents through the hub where the credentials live.
+   */
+  async callOAuthToolViaHub(serverId: string, toolName: string, args: unknown): Promise<unknown> {
+    const ownerEmail = (this.readMetadata("owner_email") ?? "").trim().toLowerCase();
+    if (!ownerEmail) throw new Error("No owner_email on this session; cannot route OAuth tool to hub");
+    const myName = this.name ?? "";
+    if (myName === ownerEmail) {
+      // We ARE the hub — call directly
+      return this.callOAuthTool(serverId, toolName, args);
+    }
+    const hubStub = await getAgentByName<Env, CodingAgent>(
+      this.env.CODING_AGENT as unknown as AgentNamespace<CodingAgent>,
+      ownerEmail,
+    );
+    return hubStub.callOAuthTool(serverId, toolName, args);
+  }
+
+  /**
+   * Connect to enabled MCP servers for this session.
+   *
+   * Fetches the effective MCP configs from UserControl (respecting per-session
+   * overrides), resolves encrypted headers, connects each gatekeeper, and
+   * pre-fetches tool listings so getTools() can read them synchronously.
+   *
+   * **TTL-cached.** Repeated calls within `MCP_REFRESH_TTL_MS` are a no-op
+   * as long as the enabled-config set hasn't changed. This matters because
+   * `onChatMessage()` calls this on every turn — without the cache, every
+   * turn paid the full reconnect + listTools cost (500ms–2s with a typical
+   * 7-server config). Use `forceReconnect: true` from explicit paths like
+   * `reconcileOwnerIdentity()` and post-auth-failure retries to bypass it.
+   *
+   * Per-config auth-header resolution is parallelised — previously the loop
+   * was sequential, so every additional server added a serial round-trip to
+   * UserControl.
+   */
+  private async connectMcpServers(options?: { forceReconnect?: boolean }): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    if (!ownerEmail) return;
+
+    const sessionId = this.sessionId();
+    if (!sessionId) return;
+
+    const forceReconnect = options?.forceReconnect === true;
+
+    try {
+      const stub = getUserControlStub(this.env, ownerEmail);
+
+      // Fetch effective configs (global configs + session overrides)
+      const configsRes = await stub.fetch(
+        `https://user-control/sessions/${encodeURIComponent(sessionId)}/effective-mcp-configs`,
+        { headers: { "x-owner-email": ownerEmail } },
+      );
+      if (!configsRes.ok) return;
+
+      const { configs } = (await configsRes.json()) as {
+        configs: Array<McpClientConfig & { overridden: boolean }>;
+      };
+
+      // Gate browser-rendering MCP on the per-session browser_enabled flag.
+      // If browser is disabled for this session, skip the browser-rendering config
+      // even if the MCP config itself is enabled.
+      const browserEnabled = this.readMetadata("browser_enabled") === "true";
+
+      // Filter to enabled HTTP configs with URLs. `oauth` (SDK-managed) is
+      // federated through the per-user hub DO and never connected from
+      // session DOs directly. `refresh_token` is connected here with a
+      // bearer header sourced from UserControl, which owns the refresh.
+      const enabled = configs.filter((c) => {
+        if (!c.enabled || c.type !== "http" || !c.url) return false;
+        if (c.auth_type === "oauth") return false;
+        if (c.id === "browser-rendering" && !browserEnabled) return false;
+        return true;
+      });
+      if (enabled.length === 0) {
+        // Edge: previously connected, now everything is disabled. Drop the
+        // old gatekeepers — leaving stale `mcpGatekeepers` would surface
+        // tools the user has just disabled.
+        if (this.mcpGatekeepers.length > 0) {
+          for (const gk of this.mcpGatekeepers) {
+            try { gk.disconnect(); } catch { /* best effort */ }
+          }
+          this.mcpGatekeepers = [];
+          this.mcpStatus.clear();
+        }
+        this.mcpConnectedAt = 0;
+        this.mcpEnabledConfigsFingerprint = "";
+        return;
+      }
+
+      // Fingerprint the enabled set so we know when to invalidate.
+      // Stable sort + join — config IDs are stable opaque strings.
+      const fingerprint = enabled.map((c) => c.id).sort().join(",");
+
+      // TTL fast-path: skip the reconnect storm if we have a recent
+      // successful connect with the same enabled set. mcpGatekeepers stays
+      // populated, so getTools() keeps seeing the same tool list.
+      //
+      // We still refresh OAuth tools from the hub on every call — that's a
+      // single peer-DO RPC, much cheaper than the gatekeeper reconnect, and
+      // it's the only way session DOs see newly-OAuth-connected servers
+      // without waiting for the full TTL window. OAuth server adds/removes
+      // happen on the hub DO via the Agents SDK and don't touch the
+      // mcp-configs fingerprint we just computed.
+      if (
+        !forceReconnect &&
+        this.mcpGatekeepers.length > 0 &&
+        isFingerprintedCacheFresh(
+          this.mcpConnectedAt,
+          this.mcpEnabledConfigsFingerprint,
+          fingerprint,
+          CodingAgent.MCP_REFRESH_TTL_MS,
+        )
+      ) {
+        await this.loadOAuthToolsFromHub(ownerEmail);
+        return;
+      }
+
+      // We're going to rebuild — disconnect the previous gatekeepers and
+      // clear status from the previous attempt.
+      for (const gk of this.mcpGatekeepers) {
+        try { gk.disconnect(); } catch { /* best effort */ }
+      }
+      this.mcpGatekeepers = [];
+      this.mcpStatus.clear();
+
+      // Helper: ask UserControl for a current access token. UserControl
+      // refreshes if expired (serialised by per-user DO single-threading).
+      const fetchRefreshTokenBearer = async (configId: string): Promise<string | null> => {
+        const tokenRes = await stub.fetch(
+          `https://user-control/mcp-configs/${encodeURIComponent(configId)}/access-token`,
+          { headers: { "x-owner-email": ownerEmail } },
+        );
+        if (!tokenRes.ok) return null;
+        const { accessToken } = (await tokenRes.json()) as { accessToken?: string };
+        return accessToken ?? null;
+      };
+
+      // Resolve auth headers for every config in parallel. Each config's
+      // headers are independent — previously this was a serial for-loop.
+      type ResolvedHeaders =
+        | { ok: true; config: typeof enabled[number]; headers: Record<string, string> | undefined }
+        | { ok: false; config: typeof enabled[number]; error: string };
+
+      const resolveHeadersFor = async (config: typeof enabled[number]): Promise<ResolvedHeaders> => {
+        try {
+          if (config.auth_type === "refresh_token") {
+            const accessToken = await fetchRefreshTokenBearer(config.id);
+            if (!accessToken) {
+              return { ok: false, config, error: "No refresh-token access token available; run set_refresh_token_mcp again" };
+            }
+            return { ok: true, config, headers: { Authorization: `Bearer ${accessToken}` } };
+          }
+          if (config.headerKeys?.length) {
+            const headers: Record<string, string> = {};
+            // Parallelise the per-header secret fetches too — they're
+            // independent UserControl reads.
+            const fetched = await Promise.all(
+              config.headerKeys.map(async (headerName) => {
+                const secretRes = await stub.fetch(
+                  `https://user-control/internal/secret/mcp:${encodeURIComponent(config.id)}:${encodeURIComponent(headerName)}`,
+                  { headers: { "x-owner-email": ownerEmail } },
+                );
+                if (!secretRes.ok) return null;
+                const { value } = (await secretRes.json()) as { value: string };
+                return { headerName, value };
+              }),
+            );
+            for (const r of fetched) {
+              if (r) headers[r.headerName] = r.value;
+            }
+            return { ok: true, config, headers };
+          }
+          return { ok: true, config, headers: undefined };
+        } catch (err) {
+          return { ok: false, config, error: err instanceof Error ? err.message : String(err) };
+        }
+      };
+
+      const resolved = await Promise.all(enabled.map(resolveHeadersFor));
+
+      // Connect each gatekeeper. We keep the inner connect/listTools work
+      // sequential because connect() opens long-lived streams and we want
+      // determinism + bounded concurrency rather than a 7-way connect burst.
+      const connected: McpClient[] = [];
+      for (const r of resolved) {
+        if (!r.ok) {
+          this.mcpStatus.set(r.config.id, {
+            name: r.config.name,
+            url: r.config.url,
+            ok: false,
+            error: r.error,
+            lastCheckedAt: Date.now(),
+          });
+          continue;
+        }
+        const { config, headers } = r;
+        try {
+          let gk = new HttpMcpClient({
+            ...config,
+            headers,
+          }, this.mcpDepth);
+
+          try {
+            await gk.connect();
+            // Pre-populate cache for synchronous getTools()
+            const tools = await gk.listTools();
+            connected.push(gk);
+            this.mcpStatus.set(config.id, {
+              name: config.name,
+              url: config.url,
+              ok: true,
+              toolCount: tools.length,
+              lastCheckedAt: Date.now(),
+            });
+          } catch (innerErr) {
+            // For refresh-token configs, a 401/auth-style failure is
+            // recoverable: force a refresh and reconnect once. UserControl
+            // is the source of truth for the token, so we ask it to
+            // refresh rather than retry with the same (probably-expired)
+            // token we just used.
+            const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+            const looksLikeAuthFail = /401|403|unauthor/i.test(msg);
+            if (config.auth_type === "refresh_token" && looksLikeAuthFail) {
+              try { gk.disconnect(); } catch { /* best effort */ }
+              const refreshRes = await stub.fetch(
+                `https://user-control/mcp-configs/${encodeURIComponent(config.id)}/access-token?force=1`,
+                { headers: { "x-owner-email": ownerEmail } },
+              );
+              if (refreshRes.ok) {
+                const { accessToken } = (await refreshRes.json()) as { accessToken?: string };
+                if (accessToken) {
+                  gk = new HttpMcpClient({
+                    ...config,
+                    headers: { Authorization: `Bearer ${accessToken}` },
+                  }, this.mcpDepth);
+                  await gk.connect();
+                  const tools = await gk.listTools();
+                  connected.push(gk);
+                  this.mcpStatus.set(config.id, {
+                    name: config.name,
+                    url: config.url,
+                    ok: true,
+                    toolCount: tools.length,
+                    lastCheckedAt: Date.now(),
+                  });
+                  continue;
+                }
+              }
+            }
+            throw innerErr;
+          }
+        } catch (error) {
+          // Log but don't fail — one broken MCP server shouldn't block the session.
+          // We also record the failure on `mcpStatus` so the UI can surface it
+          // instead of leaving the user to guess why tools never appeared.
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(
+            `MCP connect failed for "${config.name}" (${config.id}):`,
+            message,
+          );
+          this.mcpStatus.set(config.id, {
+            name: config.name,
+            url: config.url,
+            ok: false,
+            error: message,
+            lastCheckedAt: Date.now(),
+          });
+        }
+      }
+
+      this.mcpGatekeepers = connected;
+      this.mcpConnectedAt = Date.now();
+      this.mcpEnabledConfigsFingerprint = fingerprint;
+
+      // Federate OAuth MCP tools from the per-user hub DO. Tools themselves
+      // live in the hub; session DOs only hold a cached list for synchronous
+      // getTools() reads and route callTool through `callOAuthToolViaHub`.
+      await this.loadOAuthToolsFromHub(ownerEmail);
+    } catch (error) {
+      // Don't mark this as a fresh connect on failure — leave the previous
+      // fingerprint/timestamp in place so the next call retries.
+      this.mcpConnectedAt = 0;
+      this.mcpEnabledConfigsFingerprint = null;
+      console.warn("connectMcpServers failed:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  async alarm(): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    log("info", "mcp-revocation alarm fired", { ownerEmail: ownerEmail ?? null });
+    await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
+  }
+
+  private async readAppConfig(): Promise<AppConfig> {
+    const ownerEmail = this.readMetadata("owner_email");
+    if (!ownerEmail) {
+      throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
+    }
+    const stub = getUserControlStub(this.env, ownerEmail);
+    const response = await stub.fetch("https://user-control/config");
+    const appConfig = (await response.json()) as AppConfig;
+
+    const existing = this.getConfig();
+    const dodoConfig: DodoConfig = {
+      sessionId: this.sessionId(),
+      ownerEmail,
+      createdAt: this.readMetadata("created_at") ?? new Date().toISOString(),
+      browserEnabled: this.readMetadata("browser_enabled") === "true",
+      activeGateway: existing?.activeGateway ?? appConfig.activeGateway,
+      gitAuthorEmail: appConfig.gitAuthorEmail,
+      gitAuthorName: appConfig.gitAuthorName,
+      model: existing?.model ?? appConfig.model,
+      opencodeBaseURL: existing?.opencodeBaseURL ?? appConfig.opencodeBaseURL,
+      aiGatewayBaseURL: existing?.aiGatewayBaseURL ?? appConfig.aiGatewayBaseURL,
+      // Always pull the latest prefix from UserControl so config changes
+      // take effect on the next prompt without requiring a session restart.
+      systemPromptPrefix: appConfig.systemPromptPrefix,
+      // Same for subagent models — changes at the user level propagate to
+      // the next prompt without needing a session recreate.
+      exploreModel: appConfig.exploreModel,
+      taskModel: appConfig.taskModel,
+      // Dispatch-mode flags propagate via DodoConfig so getTools() sees
+      // the latest value on the next prompt without a session restart.
+      exploreMode: appConfig.exploreMode ?? "inprocess",
+      taskMode: appConfig.taskMode ?? "inprocess",
+    };
+    this.configure(dodoConfig);
+
+    return appConfig;
+  }
+
+  private async syncSessionIndex(patch: { status?: string; title?: string | null }): Promise<void> {
+    const ownerEmail = this.readMetadata("owner_email");
+    if (!ownerEmail) {
+      throw new Error("Session has no owner_email. Run migration (POST /api/admin/migrate) to fix legacy sessions.");
+    }
+    try {
+      const stub = getUserControlStub(this.env, ownerEmail);
+      await stub.fetch("https://user-control/sessions/" + this.sessionId(), {
+        body: JSON.stringify(patch),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      });
+    } catch (error) {
+      // Log but don't throw — sync failure shouldn't break prompt completion
+      console.error("syncSessionIndex failed:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  /**
+   * Compute the UserControl DO ID hex string for a given owner email.
+   * Used to identify the owner in outbound sandbox requests without exposing PII.
+   */
+  private resolveOwnerId(ownerEmail?: string): string | undefined {
+    if (!ownerEmail) return undefined;
+    return this.env.USER_CONTROL.idFromName(ownerEmail).toString();
+  }
+
+  /**
+   * Invoke an ExploreAgent facet by pool name. Thin wrapper around
+   * `this.subAgent(ExploreAgent, name).query(opts)` so tests (and the
+   * explore tool) can exercise the facet round-trip without needing a
+   * protected-method escape hatch. Requires the `"experimental"` compat
+   * flag — the SDK throws without it.
+   *
+   * Passes the parent's sessionId so the facet can call back via
+   * `facetReadFile` / `facetReadDir` / `facetGlob` to read the parent
+   * workspace ("shared" workspace mode).
+   */
+  /**
+   * Explore-facet dispatch: auto-fills the parent session context
+   * (sessionId + AppConfig) so the facet can proxy workspace reads back
+   * and use the session's provider / model selection. Called from
+   * `buildExploreTool` when `config.exploreMode === "facet"` and from
+   * the HTTP surface (via facet transcript routes).
+   */
+  async runExploreFacet(name: string, opts: ExploreQueryOpts): Promise<ExploreQueryResult> {
+    const stub = await this.subAgent(ExploreAgent, name);
+    const parentSessionId = opts.parentSessionId ?? this.sessionId();
+    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+
+    const runId = this.insertFacetRun({
+      facetType: "explore",
+      facetName: name,
+      input: opts.q,
+      workspaceMode: null,
+    });
+
+    try {
+      const result = await stub.query({ ...opts, parentSessionId, parentConfig });
+      this.completeFacetRun(runId, result.summary, { input: result.tokenInput, output: result.tokenOutput });
+      return result;
+    } catch (err) {
+      this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }
+
+  private insertFacetRun(opts: { facetType: "explore" | "task"; facetName: string; input: string; workspaceMode: string | null }): number {
+    const now = nowEpoch();
+    const rows = Array.from(this.ctx.storage.sql.exec(
+      `INSERT INTO facet_runs (facet_type, facet_name, input, workspace_mode, started_at, status)
+       VALUES (?, ?, ?, ?, ?, 'running')
+       RETURNING id`,
+      opts.facetType, opts.facetName, opts.input, opts.workspaceMode, now,
+    )) as Array<{ id: number }>;
+    return Number(rows[0]?.id ?? 0);
+  }
+
+  private completeFacetRun(runId: number, summary: string, tokens: { input: number; output: number }): void {
+    const preview = summary.length > 500 ? `${summary.slice(0, 500)}…` : summary;
+    this.ctx.storage.sql.exec(
+      "UPDATE facet_runs SET status = 'completed', summary_preview = ?, token_input = ?, token_output = ?, finished_at = ? WHERE id = ?",
+      preview, tokens.input, tokens.output, nowEpoch(), runId,
+    );
+  }
+
+  private failFacetRun(runId: number, error: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE facet_runs SET status = 'failed', summary_preview = ?, finished_at = ? WHERE id = ?",
+      `(failed) ${error.slice(0, 400)}`, nowEpoch(), runId,
+    );
+  }
+
+  // ─── Facet workspace RPCs ───
+  //
+  // Facets (ExploreAgent, TaskAgent) get their own Durable Object and so
+  // their own SqlStorage. To let a facet share the parent session's
+  // workspace — the "shared" workspace mode — the facet proxies reads back
+  // to the parent via these four narrow RPC methods. Writes are not
+  // exposed: explore is read-only, and task/scratch uses a facet-local
+  // Workspace instead (phase 4).
+
+  /** Read a file from the parent workspace. Returns null if missing. */
+  async facetReadFile(path: string): Promise<string | null> {
+    return this.workspace.readFile(path);
+  }
+
+  /** Stat a file/dir in the parent workspace. Matches Workspace.stat(). */
+  async facetStat(path: string): Promise<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string } | null> {
+    const stat = await this.workspace.stat(path);
+    return stat ?? null;
+  }
+
+  /** Read a directory in the parent workspace. */
+  async facetReadDir(path: string, opts?: { limit?: number; offset?: number }): Promise<Array<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string }>> {
+    return this.workspace.readDir(path, opts);
+  }
+
+  /** Glob the parent workspace. Used by the find and grep subtools. */
+  async facetGlob(pattern: string): Promise<Array<{ path: string; name: string; type: "file" | "directory" | "symlink"; mimeType: string; size: number; createdAt: number; updatedAt: number; target?: string }>> {
+    return this.workspace.glob(pattern);
+  }
+
+  /**
+   * Write a file into the parent workspace. Used by shared-mode task
+   * facets and by `applyFromScratch` when a scratch task merges files
+   * back. Only invoked via facet RPC — the main agent writes through
+   * `this.workspace` directly.
+   */
+  async facetWriteFile(path: string, content: string): Promise<void> {
+    await this.workspace.writeFile(path, content);
+  }
+
+  /**
+   * Real task-facet dispatch. Mirrors runExploreFacet with the added
+   * responsibility of scheduling a 24h cleanup alarm on the parent
+   * when the task runs in scratch mode — facets can't self-schedule
+   * (the Agents SDK throws on setAlarm inside a facet), so the parent
+   * owns that side of the lifecycle.
+   */
+  async runTaskFacet(name: string, opts: TaskInvokeOpts): Promise<TaskInvokeResult> {
+    const stub = await this.subAgent(TaskAgent, name);
+    const parentSessionId = opts.parentSessionId ?? this.sessionId();
+    const parentConfig = opts.parentConfig ?? (await this.readAppConfig());
+
+    const runId = this.insertFacetRun({
+      facetType: "task",
+      facetName: name,
+      input: opts.prompt,
+      workspaceMode: opts.workspaceMode ?? "shared",
+    });
+
+    let result: TaskInvokeResult;
+    try {
+      result = await stub.task({ ...opts, parentSessionId, parentConfig });
+      this.completeFacetRun(runId, result.summary, { input: result.tokenInput, output: result.tokenOutput });
+    } catch (err) {
+      this.failFacetRun(runId, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+
+    // Schedule a 24h cleanup only for scratch runs — shared runs don't
+    // own any out-of-band R2 state.
+    if (result.workspaceMode === "scratch") {
+      // 24 hours in seconds. Think's `this.schedule(seconds, method, payload)`
+      // writes a row to cron_jobs and triggers an alarm at the wall time.
+      try {
+        await this.schedule(24 * 60 * 60, "cleanupScratchFacet", {
+          facetName: name,
+          parentSessionId,
+        });
+      } catch (err) {
+        // Swallow scheduling errors — the task itself succeeded.
+        // If the alarm never fires, the scratch prefix is orphaned
+        // but harmless (it's under the user's own R2 bucket and the
+        // lifecycle rule on `attachments/` does not cover
+        // `workspace/<sid>/scratch/`). A future housekeeping cron
+        // could sweep orphaned scratch prefixes if needed — flagged
+        // as a TODO, not a blocker.
+        log("warn", "Failed to schedule scratch cleanup", { facetName: name, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * List recent facet runs on this session. Most-recent first.
+   * Backs `GET /session/:id/facets`.
+   */
+  async listFacetRuns(limit: number = 50): Promise<Array<{
+    id: number;
+    facetType: "explore" | "task";
+    facetName: string;
+    input: string;
+    summaryPreview: string | null;
+    workspaceMode: string | null;
+    tokenInput: number;
+    tokenOutput: number;
+    startedAt: string;
+    finishedAt: string | null;
+    status: "running" | "completed" | "failed";
+  }>> {
+    const rows = Array.from(this.ctx.storage.sql.exec(
+      `SELECT id, facet_type as facetType, facet_name as facetName, input,
+              summary_preview as summaryPreview, workspace_mode as workspaceMode,
+              token_input as tokenInput, token_output as tokenOutput,
+              started_at as startedAt, finished_at as finishedAt, status
+       FROM facet_runs
+       ORDER BY started_at DESC
+       LIMIT ?`,
+      Math.min(Math.max(limit, 1), 200),
+    )) as Array<{
+      id: number;
+      facetType: "explore" | "task";
+      facetName: string;
+      input: string;
+      summaryPreview: string | null;
+      workspaceMode: string | null;
+      tokenInput: number;
+      tokenOutput: number;
+      startedAt: number;
+      finishedAt: number | null;
+      status: "running" | "completed" | "failed";
+    }>;
+    return rows.map((r) => ({
+      ...r,
+      startedAt: epochToIso(r.startedAt),
+      finishedAt: r.finishedAt ? epochToIso(r.finishedAt) : null,
+    }));
+  }
+
+  /**
+   * Fetch a facet's transcript (full message log) by name. Tries
+   * ExploreAgent first, then TaskAgent — matches whichever class
+   * owns the named facet. Returns null if the facet was never
+   * instantiated on this session.
+   */
+  async getFacetTranscript(facetName: string): Promise<{ facetType: "explore" | "task"; messages: Array<Record<string, unknown>> } | null> {
+    // Look the name up in the facet_runs table to figure out which
+    // facet class to ask. Falls back to trying explore first if we
+    // can't resolve the type locally — idempotent.
+    const row = Array.from(this.ctx.storage.sql.exec(
+      "SELECT facet_type as facetType FROM facet_runs WHERE facet_name = ? ORDER BY started_at DESC LIMIT 1",
+      facetName,
+    )) as Array<{ facetType: "explore" | "task" }>;
+
+    if (row.length === 0) return null;
+
+    const facetType = row[0].facetType;
+    try {
+      if (facetType === "explore") {
+        const stub = await this.subAgent(ExploreAgent, facetName);
+        const transcript = await stub.getTranscript();
+        return { facetType, messages: transcript };
+      } else {
+        const stub = await this.subAgent(TaskAgent, facetName);
+        const transcript = await stub.getTranscript();
+        return { facetType, messages: transcript };
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Test-only: thin pass-through to the facet's scratch-write helper
+   * so unit tests can drive scratch writes without running the model.
+   * Not surfaced on any public HTTP route. Parent owns the facet name
+   * → facet stub resolution so tests don't have to know the facet SDK
+   * plumbing.
+   *
+   * Also inserts a synthetic completed `facet_runs` row so the
+   * production-grade `facetExists` gate used by `applyTaskScratch` and
+   * `getFacetTranscript` sees this facet as legitimate. A real task()
+   * run would create this row via `insertFacetRun` — tests that skip
+   * the model have to recreate that state to stay realistic.
+   */
+  async testWriteScratchFile(facetName: string, parentSessionId: string, path: string, content: string): Promise<{ ok: true }> {
+    if (!this.facetExists(facetName, "task")) {
+      const runId = this.insertFacetRun({
+        facetType: "task",
+        facetName,
+        input: "(test-seeded scratch write)",
+        workspaceMode: "scratch",
+      });
+      this.completeFacetRun(runId, "(test-seeded)", { input: 0, output: 0 });
+    }
+    const stub = await this.subAgent(TaskAgent, facetName);
+    return stub.writeScratchForTest(parentSessionId, path, content);
+  }
+
+  /**
+   * Check whether a facet with this name has ever actually run on this
+   * session. Used to 404 apply/transcript requests for arbitrary names
+   * — without this gate, `this.subAgent(TaskAgent, anyName)` would
+   * create a fresh DO on demand, letting any authenticated caller spawn
+   * unbounded empty facet DOs (billable storage, log noise) by looping
+   * random names through the apply route.
+   */
+  private facetExists(facetName: string, facetType?: "explore" | "task"): boolean {
+    const rows = facetType
+      ? Array.from(this.ctx.storage.sql.exec(
+          "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? AND facet_type = ? LIMIT 1",
+          facetName, facetType,
+        ))
+      : Array.from(this.ctx.storage.sql.exec(
+          "SELECT 1 as hit FROM facet_runs WHERE facet_name = ? LIMIT 1",
+          facetName,
+        ));
+    return rows.length > 0;
+  }
+
+  /**
+   * Merge a subset of a scratch-mode task facet's writes back into the
+   * parent workspace. Backs the `POST /session/:id/facets/:name/apply`
+   * HTTP route AND the model-facing tool that surfaces scratch writes.
+   *
+   * Idempotent — re-applying the same paths overwrites with the latest
+   * scratch content. Paths not present in the scratch-writes index
+   * come back in the `skipped` array with a reason.
+   *
+   * Throws if the facet name has no run history on this session —
+   * prevents spawning an empty facet DO via an unknown name.
+   */
+  async applyTaskScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    if (!this.facetExists(facetName, "task")) {
+      throw new FacetNotFoundError(facetName);
+    }
+    const stub = await this.subAgent(TaskAgent, facetName);
+    return stub.applyFromScratch(paths);
+  }
+
+  /** Test-only alias — kept for backwards compat with older tests. */
+  async testApplyFromScratch(facetName: string, paths: string[]): Promise<{ ok: true; applied: string[]; skipped: Array<{ path: string; reason: string }> }> {
+    return this.applyTaskScratch(facetName, paths);
+  }
+
+  /**
+   * Scheduled callback for scratch workspace cleanup. Invoked 24h
+   * after a scratch task completes (see runTaskFacet). Deletes the
+   * R2 prefix via the facet itself, then removes the facet's DO
+   * storage entirely.
+   */
+  async cleanupScratchFacet(payload: { facetName: string; parentSessionId: string }): Promise<void> {
+    try {
+      const stub = await this.subAgent(TaskAgent, payload.facetName);
+      await stub.cleanupScratch(payload.parentSessionId);
+    } catch (err) {
+      log("warn", "Scratch cleanup R2 sweep failed", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
+    }
+    try {
+      this.deleteSubAgent(TaskAgent, payload.facetName);
+    } catch (err) {
+      log("warn", "deleteSubAgent failed during scratch cleanup", { facetName: payload.facetName, err: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private async destroyStorage(): Promise<void> {
+    // Cancel every armed cron schedule before deleting the cron_jobs rows.
+    // Without this, the alarms continue firing — runCronPrompt rehydrates
+    // the DO with empty state and the "deleted" session reanimates.
+    // (audit finding H6)
+    try {
+      // The cron_jobs table's primary key column is `schedule_id`, not `id`
+      // — see the CREATE TABLE statement in initializeSchema. The previous
+      // version of this loop selected `id` and got `undefined` for every
+      // row, so the cancelSchedule calls were silent no-ops and the H6 fix
+      // shipped in d1a138f didn't actually cancel alarms. Caught by the
+      // /audit-stubs sweep on 2026-04-25.
+      const cronRows = Array.from(this.ctx.storage.sql.exec("SELECT schedule_id FROM cron_jobs"));
+      for (const row of cronRows) {
+        const id = String(row.schedule_id);
+        try {
+          await this.cancelSchedule(id);
+        } catch (err) {
+          log("warn", "destroyStorage: cancelSchedule failed", { id, err: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    } catch (err) {
+      log("warn", "destroyStorage: cron enumeration failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+
+    // Drop every table this DO writes to. Missing tables here mean stale
+    // rows hang around after a "delete" and can leak between session
+    // recreations on the same DO key.
+    this.ctx.storage.sql.exec("DELETE FROM message_metadata");
+    this.ctx.storage.sql.exec("DELETE FROM message_attachments");
+    this.ctx.storage.sql.exec("DELETE FROM prompts");
+    this.ctx.storage.sql.exec("DELETE FROM prompt_queue");
+    this.ctx.storage.sql.exec("DELETE FROM cron_jobs");
+    this.ctx.storage.sql.exec("DELETE FROM session_todos");
+    this.ctx.storage.sql.exec("DELETE FROM facet_runs");
+    this.ctx.storage.sql.exec("DELETE FROM metadata");
+
+    // Clear the daily MCP-hygiene alarm armed in onStart. ctx.storage is
+    // shared with cancelSchedule so we drop any remaining alarm wholesale.
+    try {
+      await this.ctx.storage.deleteAlarm();
+    } catch (err) {
+      log("warn", "destroyStorage: deleteAlarm failed", { err: err instanceof Error ? err.message : String(err) });
+    }
+
+    // Clean up Think sessions
+    const thinkSessionId = this.getCurrentSessionId();
+    if (thinkSessionId) {
+      this.sessions.delete(thinkSessionId);
+    }
+
+    try {
+      await this.workspace.rm("/", { force: true, recursive: true });
+    } catch {
+      // workspace may already be empty
+    }
+
+    for (const [writer] of [...this.clients]) {
+      try { void writer.close(); } catch { /* ignore */ }
+      this.clients.delete(writer);
+    }
+  }
+}
+
+/**
+ * Artifacts tokens come back as "art_v1_<secret>?expires=<unix>".
+ * Git Basic auth needs just the secret.
+ */
+export function stripTokenExpiry(token: string): string {
+  const idx = token.indexOf("?expires=");
+  return idx === -1 ? token : token.slice(0, idx);
+}

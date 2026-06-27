@@ -1,0 +1,64 @@
+# ─── Required ───
+
+# Admin user email — this is the only secret you must set.
+# This user is auto-added to the allowlist on first request and can manage other users.
+ADMIN_EMAIL=
+
+# ─── Recommended ───
+
+# 32-byte hex key for server-side envelope encryption of per-user secrets.
+# Generate with: openssl rand -hex 32
+SECRETS_MASTER_KEY=
+
+# Secret for signing session-sharing cookies.
+# Generate with: openssl rand -hex 32
+COOKIE_SECRET=
+
+# Bearer token for the MCP endpoint (/mcp and /mcp/codemode).
+# Generate with: openssl rand -base64url 32
+DODO_MCP_TOKEN=
+
+# ─── Optional: LLM gateway ───
+
+# Auth token for the OpenCode LLM gateway (only if using OpenCode gateway).
+OPENCODE_GATEWAY_TOKEN=
+
+# Auth key for the Cloudflare AI Gateway (only if using AI Gateway).
+AI_GATEWAY_KEY=
+
+# ─── Optional: Cloudflare Access ───
+# Set these to enable Cloudflare Access authentication.
+# Without Access, Dodo runs in single-user mode using ADMIN_EMAIL.
+# See: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/
+
+# CF_ACCESS_AUD=
+# CF_ACCESS_TEAM_DOMAIN=
+
+# ─── Optional: notifications ───
+# ntfy topic for worker run state-transition push notifications.
+# Leave unset to disable notifications. Public ntfy.sh accepts any topic
+# string; pick something unguessable.
+# NTFY_TOPIC=
+
+# Optional override for the publish endpoint. Defaults to https://ntfy.sh.
+# Set this to point at a self-hosted ntfy-compatible worker, e.g.
+# https://ntfy-worker.<your-subdomain>.workers.dev.
+# NTFY_BASE_URL=
+
+# Optional bearer token sent as `Authorization: Bearer <token>` on every
+# publish. Required when targeting a self-hosted ntfy worker with auth;
+# leave unset for public ntfy.sh.
+# NTFY_TOKEN=
+
+# ─── Optional: git fallbacks ───
+# Per-user GitHub/GitLab tokens are the preferred path (stored encrypted
+# in each user's UserControl DO). These env-level fallbacks are only used
+# for the admin account and only when no per-user secret is configured.
+# Set them via `wrangler secret put` in production, not via this file.
+# GITHUB_TOKEN=
+# GITLAB_TOKEN=
+
+# ─── Optional: local dev ───
+# When set to "true", auth bypass is enabled and every request is treated
+# as `dev@dodo.local`. NEVER set this in production.
+ALLOW_UNAUTHENTICATED_DEV=true
