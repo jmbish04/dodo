@@ -3,7 +3,7 @@
   "name": "dodo",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-10",
-  "compatibility_flags": ["nodejs_compat", "experimental"],
+  "compatibility_flags": ["nodejs_compat"],
   // Allow `*.wasm` imports to resolve to `WebAssembly.Module` at deploy
   // time. Required by `src/tools/shell.ts` which static-imports
   // busybox.wasm + initramfs.wasm from vendor/wasm/busybox/. Wrangler
